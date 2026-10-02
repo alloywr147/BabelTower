@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "fingerprint": "fnv1a-355fc3f3",
+  "fingerprint": "fnv1a-bd57c0e6",
   "langs": [
     "schinese",
     "english"
@@ -847,10 +847,6 @@
     "citadel_chatwheel_label_going_shop": [
       "商店",
       "Shop"
-    ],
-    "citadel_chatwheel_message_going_shop": [
-      "去商店",
-      "Going to Shop"
     ],
     "citadel_chatwheel_label_going_corrupted_shop": [
       "异化商店",

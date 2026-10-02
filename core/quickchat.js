@@ -62,7 +62,8 @@ const REMOVE_KEYS = new Set([
   "citadel_chatwheel_have_heal",    // 有治疗 / Have Heal
   "citadel_chatwheel_heal_please",  // 请治疗 / Heal Please
   "citadel_chatwheel_need_heal",    // 需要治疗 / Need Heal
-  "citadel_chatwheel_going_shop",   // 去商店 / Going to Shop
+  "citadel_chatwheel_going_shop",   // 去商店 / Going to Shop(旧 key,10/1 更新后游戏已改名,保留防旧语料回退)
+  "citadel_chatwheel_message_going_shop", // 去商店 / Going to Shop(10/1-10/2 更新后的新 key)
 ]);
 
 // 收录某语言本地化文件中的快捷语音模板;返回 { templates, skipped }

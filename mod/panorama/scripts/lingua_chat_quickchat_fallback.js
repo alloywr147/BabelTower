@@ -1,7 +1,7 @@
 // 自动生成 by core/quickchat.js —— 请勿手改;游戏更新后重跑 node core/quickchat.js 并重编 VPK
 // 桥离线时的快捷语音模板兜底语料(双语,来自本地真实文件)。
 // 指纹以全局变量暴露,客户端 syncQuickChat 握手用;旧兑底文件无此变量 → 客户端按指纹缺失路径处理
-LCT_QUICKCHAT_FALLBACK_FINGERPRINT = "fnv1a-355fc3f3";
+LCT_QUICKCHAT_FALLBACK_FINGERPRINT = "fnv1a-bd57c0e6";
 LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "攻击分路",
  "Attacking Lane",
@@ -420,8 +420,6 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "Going to farm",
  "前去带线",
  "Going to rat",
- "去商店",
- "Going to Shop",
  "前往基地",
  "Going to base",
  "前往{s:param_1}增益",

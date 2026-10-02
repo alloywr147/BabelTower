@@ -40,10 +40,11 @@ expectSkip("疗伤幽灵还要冷却1秒");
 expectSkip("疗伤幽灵还要冷却11秒");
 expectSkip("遥控夜枭准备就绪！");
 expectSkip("Restorative Locket is on cooldown for 6s");
-expectSkip("我们去推进黄路吧");
+// 2026-10-02 游戏更新取证(当前 citadel_main loc + 实车 dump):
+//   路名 黄路→约克(值静态,渲染=值,零参数歧义)
+expectSkip("我们一起推约克");        // 旧:我们去推进黄路吧(ping_push_yellow 改值)
 expectSkip("防守分路！");
-expectSkip("黄路需要帮助！");
-expectSkip("小心！McGinnis有灵能涌动");
+expectSkip("约克需要支援！");        // 旧:黄路需要帮助！(Help_yellow 改值,语料存去尾标点)
 expectSkip("Mo & Krill不见了");          // 参数含 & 与空格(旧正则漏杀类)
 expectSkip("Lady Geist is Missing");     // 多词英文名
 expectSkip("小 心");                     // 渲染空格不稳定
@@ -62,14 +63,20 @@ expectTrans("join our party please");
 expectTrans("123456");
 expectTrans("他也不见了");               // CJK 参数不允许,防误杀
 expectTrans("人不见了！！");
+// 2026-10-02 取证:ping_enemy_has_item 旧值 "小心！{p1}有{p2}" 已改 "有{p2}"(zh),
+// 旧渲染形态不再由游戏产生 → 属真人输入。新 zh 渲染固定段仅 1 字("有"),
+// 过筛策略(≥2 字)拒绝收录 → 该轮盘消息由结构判定(Ping/PingLabel)兜底,模板层刻意不接。
+expectTrans("小心！McGinnis有灵能涌动");
 
 console.log("--- 匹配缓存:同文本双通道只走查一次 ---");
+// 2026-10-02:输入从 "Venator不见了" 换为路名模板 —— missing_hero 参数被游戏移除待实车复核,
+// 缓存测试与该组解耦,选零参数零歧义的静态值模板(推送约克,高频轮盘)
 clearMatchCache();
 resetWalkCount();
-const first = matchesQuickTemplate("Venator不见了");
-const second = matchesQuickTemplate("Venator不见了");       // 同通道第二次(缓存命中)
-const third = matchesQuickTemplate("Venator不见了！！！");   // 叠标点变体(剥尾后同键,也命中缓存)
-const fourth = matchesQuickTemplate("Venator不见了！");      // 另一变体
+const first = matchesQuickTemplate("推进约克");
+const second = matchesQuickTemplate("推进约克");       // 同通道第二次(缓存命中)
+const third = matchesQuickTemplate("推进约克！！！");   // 叠标点变体(剥尾后同键,也命中缓存)
+const fourth = matchesQuickTemplate("推进约克！");      // 另一变体
 ok(first === true && second === true && third === true && fourth === true, "缓存后结果一致(4 次调用全 true)");
 ok(getWalkCount() === 1, "同文本+叠标点变体只走查 1 次(实际 " + getWalkCount() + ")");
 
@@ -111,8 +118,8 @@ expectSkip("Pushing Zipline");
 expectSkip("攻击 1 级");
 expectSkip("防守基地");
 expectSkip("Attacking Lane");
-expectSkip("推进黄路");
-expectSkip("Push Yellow");       // 英文值曾带 </span> 残留,生成侧已剥 HTML 标签
+expectSkip("推进约克");                // 2026-10-02:旧 推进黄路(路名改名,值静态)
+expectSkip("Push York");             // 英文值曾带 </span> 残留,生成侧已剥 HTML 标签
 expectSkip("帮我护送灵瓮");
 expectSkip("Help me deliver the urn");
 expectSkip("我可以治疗你，Graves");  // can_heal 带参数,保留(非高频手打形态)
@@ -129,7 +136,7 @@ ok(mutated === 0, "灌 " + (LIMIT + 10) + " 条未命中文本:全部正确 tran
 ok(getWalkCount() === LIMIT + 10, "上限清空后仍逐条走查(实际 " + getWalkCount() + ")");
 clearMatchCache();
 resetWalkCount();
-ok(matchesQuickTemplate("Venator不见了") === true, "清空后高频模板仍正确命中");
+ok(matchesQuickTemplate("推进约克") === true, "清空后高频模板仍正确命中");
 ok(getWalkCount() === 1, "清空后重新走查 1 次");
 
 console.log("RESULT: PASS " + pass + " / FAIL " + fail);

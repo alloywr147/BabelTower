@@ -15,5 +15,8 @@
   "maxQueue": 200,
   "watchGame": true,
   "watchGameExe": "deadlock.exe",
-  "logFile": "logs/bridge.log"
+  "logFile": "logs/bridge.log",
+  "gameLogTail": true,
+  "gameLogPath": "",
+  "gameLogMarkers": ["[LCT]", "BT_"]
 }

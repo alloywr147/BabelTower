@@ -61,6 +61,12 @@ const DEFAULTS = {
   watchGameExe: "deadlock.exe",
   // 文件日志(相对项目根目录;默认落盘到 logs/bridge.log,便于用户反馈时提供调试信息)
   logFile: "logs/bridge.log",
+  // EXP6727: 游戏 console.log 尾随(出站侧信道 B 通道)。
+  // gameLogPath 为空时按已知安装路径自动探测;文件不存在(游戏未启动)时每秒重试。
+  gameLogTail: true,
+  gameLogPath: "",
+  // 只有命中这些标记的游戏日志行才转发进 bridge.log(防引擎日志刷屏)
+  gameLogMarkers: ["[LCT]", "BT_"],
 };
 
 function configDir() {

@@ -74,6 +74,101 @@ const providerRegistry = require("./providers/registry");
 const dictionary = require("./dictionary");
 const nameProtect = require("./name_protect");
 const quickchat = require("./quickchat");
+// ---------- BTIPC v1(规格 docs/btipc-v1.md)----------
+// 窗口表(§6 状态机/§14.2 隔离)+ console.log tail 的 REQ/TRQ/CAN 解析(§14.1 校验,非法静默 drop 只记 WARN)。
+// 两条传输路径完全分离,共用同一套帧/窗口/重试核心:
+//   REQ(③/⑤)回声 conformance —— 同步 setFrames(原文),/bt6736 走这条,不碰翻译 API。
+//   TRQ(⑥)翻译            —— 先建窗(frames=null → BUSY),翻译完成后异步 setFrames。
+// 翻译层只见 BTIPC 的 window/frames,不见 Image panel、200/404、round、CRC、STORM。
+const btipcWin = require("./btipc/window.js");
+const btipcXfer = require("./btipc/transport.js");
+const btipcFramer = require("./btipc/framer.js");
+const btipcTable = new btipcWin.WindowTable();
+
+// 翻译失败时的信号:空 END 帧(len=0)。协议零改动(§3 无新位段),客户端 translate 模式下
+// 收到空串即判定 translate_error。回声模式不做此判定 —— "" 是合法回声。
+const btipcTrqInflight = new Set();
+
+function onBtipcGameLine(line) {
+  const parsed = btipcXfer.parseGameLine(line);
+  if (!parsed.ok) {
+    if (parsed.skip) return; // 普通 [LCT] 行,与 BTIPC 无关
+    log("warn", "BTIPC drop (" + parsed.reason + ")"); // §14.1:静默 drop + 一行 WARN
+    return;
+  }
+  if (parsed.cmd === "REQ") {
+    const tr = btipcTable.acceptReq(parsed.win, parsed.id, parsed.payload);
+    try {
+      tr.frames = btipcFramer.encode(parsed.id, parsed.payload);
+      log("info", "BTIPC REQ w=" + parsed.win + " id=" + parsed.id + " len=" + parsed.len + " echo frames=" + tr.frames.length);
+    } catch (e) {
+      log("warn", "BTIPC encode failed: " + e.message);
+    }
+  } else if (parsed.cmd === "TRQ") {
+    onBtipcTranslateReq(parsed);
+  } else if (parsed.cmd === "CAN") {
+    btipcTrqInflight.delete(parsed.win);
+    btipcTable.cancel(parsed.win);
+    log("info", "BTIPC CAN w=" + parsed.win);
+  }
+}
+
+// ⑥ 翻译请求:窗口先存在(frames=null → 客户端拿 BUSY),数据帧后填充。
+// 翻译耗时(100ms~8s/超时)完全落在窗口等待期,不污染 BTIPC 传输状态机。
+async function onBtipcTranslateReq(parsed) {
+  const win = parsed.win;
+  const text = parsed.payload.toString("utf8");
+  const tReq = Date.now();
+  // acceptReq 建窗;frames 保持 null → serveDL 返 BUSY。setFrames 失败(窗口已 GC)时静默丢弃。
+  const tr = btipcTable.acceptReq(win, parsed.id, parsed.payload);
+  tr.translate = true;
+  btipcTrqInflight.add(win);
+  log("info", "BTIPC TRQ w=" + win + " id=" + parsed.id + " len=" + parsed.len +
+      " text=" + JSON.stringify(text.slice(0, 60)) + " (BUSY until translated)");
+
+  let out = null;
+  let errMsg = null;
+  try {
+    const cfg = configStore.load();
+    const result = await runTranslate(cfg, { text: text });
+    out = String(result.translation == null ? "" : result.translation);
+    // 缓存非词典命中结果 + 自适应学习(与 /api/v1/translate 同语义)
+    if (result && !result.viaDictionary && !result.viaCache) {
+      const tl = cfg.defaults.targetLanguage || "zh-Hans";
+      transCacheSet(result._protectedText || text, tl, result.translation, result.detectedLanguage);
+      dictionary.record(result._protectedText || text, tl, result.translation, result.detectedLanguage);
+    }
+  } catch (e) {
+    errMsg = (e && e.message) || String(e);
+  }
+
+  btipcTrqInflight.delete(win);
+  const dt = Date.now() - tReq;
+  let frames;
+  try {
+    // 失败也 setFrames:空 END 帧让客户端走到 Promise 结算,而不是耗到 REQ_TIMEOUT。
+    frames = btipcFramer.encode(parsed.id, out == null ? "" : out);
+  } catch (e) {
+    log("warn", "BTIPC TRQ encode failed w=" + win + ": " + e.message);
+    return; // 留在 BUSY,由客户端 REQ_TIMEOUT 兜底
+  }
+  if (!btipcTable.setFrames(win, frames)) {
+    log("info", "BTIPC TRQ w=" + win + " dropped: window gone (GC/CAN)");
+    return;
+  }
+  if (errMsg !== null) {
+    log("warn", "BTIPC TRQ w=" + win + " translate failed after " + dt + "ms: " + errMsg.slice(0, 120) +
+        " -> empty END frame (client rejects as translate_error)");
+  } else {
+    log("info", "BTIPC TRQ w=" + win + " ok dt=" + dt + "ms out=" + out.length + "B frames=" + frames.length);
+  }
+}
+
+// 窗口 GC(§6):END 帧服务后 10s,或 60s 无活动
+setInterval(function () {
+  const n = btipcTable.gc();
+  if (n > 0) log("info", "BTIPC GC removed=" + n + " remain=" + btipcTable.size());
+}, 10000);
 // 首次运行生成词典文件;桥启动后自动落盘高频词(自适应学习)
 // (顶部 for 循环已逐个 require 过五个模块,这里直接拿句柄用,不重复 require)
 dictionary.ensureFile();
@@ -814,6 +909,42 @@ async function handleApi(req, res, url, bodyObj) {
 // 原因:游戏客户端用 BRIDGE_HOST="localhost",而 Windows 上 localhost 优先解析为 IPv6 回环 ::1;
 // 若只绑 127.0.0.1,游戏连 localhost 会落到 ::1 被拒 => bridgeUp 永远 false => 面板显示"未运行"。
 // 双回环后无论 localhost 解析到哪个都连得上,且两者均不暴露到局域网。
+// ---------- EXP-6726g:最小 PNG 编码器(尺寸编码信道的回传载体) ----------
+// RGB 真8位,单 IDAT,filter 全 0;尺寸即数据(游戏侧读面板固有宽高解码)
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+function pngCrc(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i += 1) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(pngCrc(body), 0);
+  return Buffer.concat([len, body, crc]);
+}
+function makeRgbPng(w, h) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // color type RGB
+  const raw = Buffer.alloc((w * 3 + 1) * h); // 每行前置 filter byte 0
+  const idat = require("zlib").deflateSync(raw, { level: 1 });
+  return Buffer.concat([PNG_SIG, pngChunk("IHDR", ihdr), pngChunk("IDAT", idat), pngChunk("IEND", Buffer.alloc(0))]);
+}
+
 const requestHandler = (req, res) => {
   let url;
   try {
@@ -821,6 +952,163 @@ const requestHandler = (req, res) => {
   } catch (e) {
     res.statusCode = 400;
     res.end("bad request");
+    return;
+  }
+
+  // EXP6729: 图片响应状态码差分 — 200/404/500/204 验证 ImageLoaded 是否只在成功时触发。
+  // 若触发与状态码相关 = 响应状态即入站位元通道(事件驱动,J4 天然异步)。
+  if (url.pathname === "/probe_img") {
+    const code = parseInt(url.searchParams.get("code"), 10) || 200;
+    const n = url.searchParams.get("n") || "-";
+    log("info", "PROBE-IMG code=" + code + " n=" + n);
+    res.statusCode = (code >= 200 && code < 600) ? code : 200;
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    if (code === 204) { res.end(); return; }
+    if (code >= 200 && code < 300) {
+      res.setHeader("Content-Type", "image/png");
+      res.end(makeRgbPng(1, 1));
+    } else {
+      res.setHeader("Content-Type", "text/plain");
+      res.end("error " + code);
+    }
+    return;
+  }
+
+  // EXP6734-B/D: 位元延迟端点 — 固定 200 PNG,逐条落底(服务端视角算丢失/乱序;
+  // URL 带 round 参数保证每轮唯一,无跨轮缓存;6734-D 增带 c=<cfg>@<run> 按配置分组,
+  // 无 c 时保持旧格式 BIT id=.. round=.. (6734-B 分析器兼容)
+  if (url.pathname === "/probe_bit") {
+    const bitId = url.searchParams.get("id") || "-";
+    const bitRound = url.searchParams.get("round") || "-";
+    const bitCfg = url.searchParams.get("c") || "-";
+    if (bitCfg === "-") log("info", "BIT id=" + bitId + " round=" + bitRound);
+    else log("info", "BIT c=" + bitCfg + " id=" + bitId + " round=" + bitRound);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.end(makeRgbPng(1, 1));
+    return;
+  }
+
+  // EXP6734-E: 多值符号判别实验 —— 一个 Image 面板能否承载 >1 bit?
+  // 状态机: 2xx(200/201/204/206)→空 PNG=200;3xx(301/302/304/307)→302 到 /rdata?f=E<code>;
+  // 4xx(400/401/403/404)→对应 statusCode+短 HTML;5xx(500/503)→同上。
+  // 每符号每轮仅首次落底,服务端无状态;判读只看游戏侧行为差异(loaded / loaded-late / 静默)。
+  if (url.pathname === "/probe_e") {
+    const eId = url.searchParams.get("id") || "-";
+    const eRound = url.searchParams.get("round") || "-";
+    const eCode = parseInt(url.searchParams.get("code") || "0", 10) || 0;
+    log("info", "EIT id=" + eId + " round=" + eRound + " code=" + eCode);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    if (eCode >= 200 && eCode < 300) {
+      res.statusCode = eCode;
+      res.setHeader("Content-Type", "image/png");
+      res.end(makeRgbPng(1, 1));
+    } else if (eCode >= 300 && eCode < 400) {
+      res.statusCode = eCode;
+      res.setHeader("Location", "/rdata?f=E" + eCode + "&o=E" + eCode);
+      res.setHeader("Content-Type", "text/html");
+      res.end("<html><body>302</body></html>");
+    } else if (eCode >= 400) {
+      res.statusCode = eCode;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end("<html><body>E" + eCode + "</body></html>");
+    } else {
+      // code=0 兜底: 与 200 同形(防手滑打错 code 时把样本误判为 2xx)
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "image/png");
+      res.end(makeRgbPng(1, 1));
+    }
+    return;
+  }
+
+  // EXP6733: 302 重定向高带宽入站实验。
+  // /redir302?o=<原标记>&f=<最终标记> -> 302 Location=/rdata?f=<最终标记>
+  // /rdata 到达 = 引擎跟随了重定向;若 ImageLoaded 回读到 f 标记 = 最终 URL 可读 = 文本入站成立。
+  if (url.pathname === "/redir302") {
+    const o = url.searchParams.get("o") || "";
+    const f = url.searchParams.get("f") || "";
+    log("info", "PROBE-REDIR o=" + o + " f=" + f);
+    res.statusCode = 302;
+    res.setHeader("Location", "/rdata?f=" + encodeURIComponent(f));
+    res.setHeader("Cache-Control", "no-store");
+    res.end();
+    return;
+  }
+  if (url.pathname === "/rdata") {
+    const f = url.searchParams.get("f") || "";
+    log("info", "PROBE-RDATA f=" + f + " (engine FOLLOWED the redirect)");
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.end(makeRgbPng(1, 1));
+    return;
+  }
+
+  // EXP6727: 探针信标路由 — Panorama Image.SetImage("/probe?seq=..&d=..") 到达即记录。
+  // 双重用途: ① 验证 Image 出站通道仍活; ② 把诊断结果(console.log 同步双路上报)回传落盘。
+  if (url.pathname === "/probe") {
+    const seq = url.searchParams.get("seq") || "-";
+    const part = url.searchParams.get("p") || "";
+    const data = url.searchParams.get("d") || "";
+    log("info", "PROBE seq=" + seq + (part ? " p=" + part : "") + " " + data);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.end(makeRgbPng(1, 1));
+    return;
+  }
+
+  // EXP-6726g:尺寸回读探针 — 固定 133x77 RGB PNG,验证 Image 面板固有尺寸可经 actuallayoutwidth 读回
+  if (url.pathname === "/dim.png") {
+    log("info", "IMG-HIT id=" + (url.searchParams.get("id") || "?") + " dim-route");
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.end(makeRgbPng(133, 77));
+    return;
+  }
+
+  // EXP-6726f:图片通道探针 — 游戏 Image 面板 SetImage(http://...) 的请求是否到达桥。
+  // 到达即记 IMG-HIT 日志(带 id 参数区分探测来源);返回 1x1 透明 PNG + 禁缓存。
+  if (url.pathname === "/test.png") {
+    log("info", "IMG-HIT id=" + (url.searchParams.get("id") || "?") + " (Image panel request REACHED bridge)");
+    const PNG1x1 = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "base64"
+    );
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.end(PNG1x1);
+    return;
+  }
+
+  // BTIPC v1 下行(规格 docs/btipc-v1.md §3.1/§6):每面板一位 —— 位=1 → 200 PNG,位=0 → 404。
+  // 帧号只由轮号现算 idx = r - frameStartRound(§4.0 幂等),未知窗口 → 404。
+  if (url.pathname === "/btipc/dl") {
+    const out = btipcXfer.serveDL(btipcTable, {
+      w: url.searchParams.get("w") || "",
+      r: url.searchParams.get("r") || "",
+      p: url.searchParams.get("p") || "",
+      t: url.searchParams.get("t") || "",
+    });
+    res.statusCode = out.status;
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    if (out.status === 200) {
+      res.setHeader("Content-Type", "image/png");
+      res.end(makeRgbPng(1, 1));
+    } else {
+      res.end();
+    }
     return;
   }
 
@@ -863,6 +1151,90 @@ const HOST_V6 = "::1";
 
 startGameWatch();
 startVersionCheckOnBoot();
+startGameLogTail();
+
+// ---------- EXP6727: 游戏 console.log 尾随(B 通道) ----------
+// 链路: Panorama $.Msg / ConsoleCommand("echo ...") -> 游戏 console.log(-condebug)
+//      -> 桥轮询尾随 -> logs/bridge.log(命中 gameLogMarkers 的行)。
+// 这是已证实的出站信道(console.log 实测有 [PanoramaScript] [LCT] 行),
+// 用于: ① 自动采集游戏内诊断探针结果; ② 评估 B 通道作为长期出站方案的吞吐/截断/编码表现。
+// 设计要点:
+//   - 游戏通常在桥之后启动,文件不存在时静默重试(每秒),找到后才开始尾随;
+//   - 游戏重启会截断/轮转文件(size < pos -> 归零重来);
+//   - 行过滤靠 marker([LCT] / BT_),防引擎日志刷屏;命中行的后续行(同批最多 3 行)
+//     作为多行消息续行一并转发(测 B6 换行完整性);
+function startGameLogTail() {
+  if (cfg.gameLogTail === false) return;
+  const markers = Array.isArray(cfg.gameLogMarkers) && cfg.gameLogMarkers.length
+    ? cfg.gameLogMarkers
+    : ["[LCT]", "BT_"];
+  const candidates = [];
+  if (cfg.gameLogPath) candidates.push(cfg.gameLogPath);
+  candidates.push("F:/SteamLibrary/steamapps/common/Deadlock/game/citadel/console.log");
+  candidates.push("C:/Program Files (x86)/Steam/steamapps/common/Deadlock/game/citadel/console.log");
+
+  let foundPath = null;
+  let filePos = 0;
+  let partial = "";
+
+  function emit(line) {
+    if (line.length > 4000) line = line.slice(0, 4000) + "...<truncated>";
+    log("game", line.replace(/\r$/, ""));
+  }
+
+  setInterval(function () {
+    try {
+      if (!foundPath) {
+        for (let i = 0; i < candidates.length; i += 1) {
+          const c = candidates[i];
+          try {
+            if (c && fs.existsSync(c)) { foundPath = c; break; }
+          } catch (e) {}
+        }
+        if (!foundPath) return;
+        partial = "";
+        // 从文件末尾开始: 只采集启动后的新行,不重放历史会话(否则旧 [LCT] 行混入难分辨)
+        try { filePos = fs.statSync(foundPath).size; } catch (e) { filePos = 0; }
+        log("info", "game console.log found: " + foundPath + " (tail started at pos " + filePos + ", markers: " + markers.join(", ") + ")");
+      }
+      let st;
+      try { st = fs.statSync(foundPath); } catch (e) { return; }
+      if (st.size < filePos) { filePos = 0; partial = ""; } // 游戏重启截断/轮转
+      if (st.size === filePos) return;
+      const len = st.size - filePos;
+      const buf = Buffer.alloc(len);
+      const fd = fs.openSync(foundPath, "r");
+      fs.readSync(fd, buf, 0, len, filePos);
+      fs.closeSync(fd);
+      filePos = st.size;
+      let text = partial + buf.toString("utf8");
+      const lastNl = text.lastIndexOf("\n");
+      if (lastNl === -1) { partial = text; return; }
+      partial = text.slice(lastNl + 1);
+      text = text.slice(0, lastNl);
+      const lines = text.split(/\r?\n/);
+      let contBudget = 0;
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        if (!line) continue;
+        let hit = false;
+        for (let m = 0; m < markers.length; m += 1) {
+          if (line.indexOf(markers[m]) !== -1) { hit = true; break; }
+        }
+        if (hit) {
+          emit(line);
+          onBtipcGameLine(line); // BTIPC REQ/CAN(非 BTIPC 行在解析内静默忽略)
+          contBudget = 3; // 命中行之后同批的后续行视作多行消息续行
+        } else if (contBudget > 0) {
+          contBudget -= 1;
+          emit("  (cont) " + line);
+        }
+      }
+    } catch (e) {
+      // 尾随失败不能影响桥本体
+    }
+  }, 1000);
+}
 
 // 端口被占用 = 已有实例在运行,静默退出(与启动器/开机自启场景兼容)。
 // 两台 server 都 EADDRINUSE 才说明确有实例在跑;单台绑定失败(如该回环未启用)忽略。

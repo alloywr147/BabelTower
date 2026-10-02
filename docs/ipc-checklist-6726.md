@@ -1,0 +1,380 @@
+# Deadlock 6726 Panorama IPC 检查表 — exp6727~6734C 实测全记录
+
+> 部署:2026-10-01 · mod 最新 `v1.0.7-6726-exp6734C`(装在 addons/**pak15_dir.vpk**,DMM 登记 local-d0264ee4;备份 `pak15_dir.vpk.bak-pre-exp6734C-1001-223452`;上一版备份 `bak-pre-exp6734B-1001-173951`)
+> 桥:`core/bridge_server.js` 含 `/probe` 信标、`/probe_img` 状态码差分、游戏 console.log 尾随器
+> 检查表原始出处:`新建 文本文档.txt`(A~J 节)
+
+---
+
+## 1. 探针 → 检查项对照(exp6727)
+
+探针在游戏启动 5s 后自动运行一次(每会话),输出走**双路上报**:
+
+| 源 | 路径 | 覆盖 |
+| --- | --- | --- |
+| ① `$.Msg` → 游戏 `console.log` → 桥尾随 | `logs/bridge.log` 中 `[game]` 行 | B2~B6 + 全部 `exp67xx:` 结果行 |
+| ② Image 信标 `SetImage(/probe?d=..)` | `logs/bridge.log` 中 `PROBE` 行 | 出站通道本身 + 结果冗余副本 |
+
+收结果命令:
+
+```bash
+grep -E "exp67|3[0-2]-[①②③]|3[0-2]-SUM|PROBE-IMG|\[game\]" F:/BabelTower/logs/bridge.log | tail -100
+```
+
+---
+
+## 2. exp6727 状态回填表(基础面)
+
+| # | 项目 | 状态 | 备注 |
+| --- | --- | --- | --- |
+| A1 | GameInterfaceAPI 存在 | ❌ | `typeof = undefined`,顶层真不存在 |
+| A2–A5 | ConsoleCommand / Get·SetSettingString / CommandLine | ❌ | 全局同名均不存在 |
+| A6/A7 | 设置值 ⇄ Bridge | ⬜ | 阻塞(A3/A4 死) |
+| B1 | ConsoleCommand 执行 | ⬜ | 依赖 A2 |
+| B2 | Console → Log | ✅ | `$.Msg` 全部落 console.log |
+| B3 | Bridge 监听 Log | ✅ | 1s 轮询尾随,到达延迟 1~9s |
+| B4 | 长字符串 100/500/1000 | ✅ | 实测 133/533/1033 字节**精确相等,零截断** |
+| B5 | 高频 ×10 | ✅ | 10/10 零丢包 |
+| B6 | 特殊字符/换行 | ✅ | 中文/日文/emoji/JSON 完整;换行续行 `(cont)` 捕获 |
+| C1–C3 | Clipboard | ❌/⚠️ | 三面扫描 NONE;getOwnPropertyNames 复核也无 clip 命名 |
+| D1–D3 | CitadelHTMLPanel 创建+枚举 | ✅ | ~300 项全枚举 |
+| D4 | SetURL 产生请求 | ❌ | 见 §4 scheme 判死 |
+| D5–D8 | 导航/执行方法 | 💡 | 漏网发现 `RunScriptInPanelContext`(见 6728 域名拦截)/`WriteCompositionLayerPNG` |
+| D9/D10 | title/location | ❌ | undefined |
+| E1 | 事件注册 | ⚠️ | 自定义名被拒 → 白名单制(6728 探出清单) |
+| I0 | 全局面枚举 | ✅⚠️ | for..in 仅可枚举;getOwnPropertyNames 见 §4 |
+
+---
+
+## 3. exp6728~6731 入站攻坚过程结论
+
+| 轮 | 实验 | 结论 |
+| --- | --- | --- |
+| 6728 | RSI 调用 | API 为真但被域名检查拦:`must be called from a context with a domain that matches this panel`;签名=`takes 1 arguments [script]`;`location/document/window` 全 undefined → JS 侧无法探域,暂死 |
+| 6728 | 隐藏全局扫描 | 顶层无 GameInterfaceAPI/GameEvents/CustomNetTables;`$`≡`panorama`(29 函数);新发现 `RegisterEventHandler`/`BImageFileExists`/`DispatchEvent` |
+| 6728 | 事件白名单 | **8 个 VALID**:ClientUI_FireOutput, PanelLoaded, HTMLLoadPage, HTMLStartRequest, HTMLFinishRequest, HTMLURLChanged, HTMLTitle, **ImageLoaded**;52 INVALID |
+| 6729 | SetURL 变体矩阵 | **scheme 级判死**:仅 about:blank 触发 HTMLLoadPage;file:// 与 http://(含 localhost/127.0.0.1) 在 LoadPage 前被拒回落空页,0 请求到桥 |
+| 6729 | Data() | `{}` 空对象,死 |
+| 6730 | BImageFileExists | **s2r:// 资源查询 API**(真实 s2r 路径 true,其余全 false),桥不可写该命名空间 → 封案 |
+| 6730 | REH arity | **恰好 3 参**;第 2 参 = 面板 id 或面板对象 |
+| 6730 | ImageLoaded 差分 v1 | 全 NO——探针缺陷(同面板覆盖 + 1.1s 窗口太短) |
+| 6731 | 自建面板能否触发 | **能**(LCTImgProbe/LCTDimProbe 实证);`REH(panelObj)` **OK**;`REH(idStr)` 报错暴露 id 查找仅限 XML 布局上下文(chat.xml) |
+
+---
+
+## 4. exp6732 最终结果 — ⭐ 反向通道闭环
+
+```
+四面板各单发一次,永不覆盖;P200/P404 同挂双路回调:
+
+                Bridge HTTP    Unhandled    REH(panel-bound)
+LCTP200            200 ✅        FIRED x1       FIRED        ← 同一毫秒双路同时到达
+LCTP404            404 ✅          NO            NO
+LCTP500            500 ✅          NO            —
+LCTPR           连接拒绝           NO            —
+
+32-SUM unhandled = LCTP200:FIRED x1 | LCTP404:NO | LCTP500:NO | LCTPR:NO
+32-SUM reh       = REH:200:FIRED | REH:404:NO
+```
+
+**判定:Bridge → Panorama 反向通道成立。**
+
+- 信道:`Bridge 控制 HTTP 状态码 → Image 面板 → ImageLoaded → JS 回调` = **状态码位元**(200=1 / 非200=0)
+- 双路回调行为完全一致,任选;REH 可按面板绑定 → 多面板天然并行
+- 延迟:开机风暴期 SetImage→请求发出 ≈ 5.9s(引擎队列),**响应→事件 = 毫秒级**;对局中延迟待测
+- 探针铁律:**同一面板禁止重复 SetImage**(覆盖取消);判定不轮询,handler 自报告
+
+---
+
+## 5. J 记分(终版)
+
+| # | 项 | 状态 | 依据 |
+| --- | --- | --- | --- |
+| J1 | 出站 | ✅✅ 双通道 | Image 信标(PROBE seq 有序零丢) + console.log tail(1000 字符零截断/10 连发零丢/UTF-8 完整) |
+| J2 | 入站 | ✅ **位元级+吞吐已量化** | exp6732 状态码差分 + 双路回调;6734-B 实测 1280 样本零丢: P50=173ms / P99=1365ms, 64 面板常态 ~190 bit/s |
+| J3 | 唯一 ID | ✅ | seq 递增完整;请求可带 `n`/`id` 参数 |
+| J4 | 异步 | ✅ | 事件驱动,多面板并行,不阻塞 |
+| C5 | 发送前回填 | ✅ | exp6734-C:拦截 Enter → 改写 `input.text` → 第2下走原版链路发出,**服务端回显 = 改后文**(23:13:35 `row[chat#36] SENT=MODIFIED`) |
+
+---
+
+## 6. exp6733~6734 收尾三轮
+
+| 轮 | 实验 | 结论 |
+| --- | --- | --- |
+| 6733 | 302 重定向高带宽入站 | 引擎跟随重定向(桥见 `PROBE-RDATA f=BT_FINAL33`,loaded=2),但**四层回读全空**:字符串 diff / URL 扫描 / GetAttributeString 6 键 / 5 个猜名方法全部读不回最终 URL → **高带宽文本入站关闭** |
+| 6734-A | Image 面板 93 函数全量枚举 | hits 仅 6 个且全是写入型(SetImage/SetImageFromPanel/SetImageFromFile/SetCompositionLayerTextureName/FindChildInLayoutFile/FindPanelInThisOrParentLayoutFile),**零 Get* 回读口 → src 回读永久关死**;全量名单在 bridge.log `34-A[...] all fns` 4 片 |
+| 6734-B | 64 面板 × 20 轮位元延迟 | 见 §7 实测数据;**入站位元通道吞吐定案** |
+| 6734-C | 输入框读写 + 两段 Enter 发送回填 | 见 §8;**TextEntry 读写全成立,改写文本经原版链路发出(SENT=MODIFIED)→ 发送前翻译回填路线成立** |
+
+备查未测(用户要求不扩散):`SetPanelEvent` / `WriteCompositionLayerPNG` / `SetImageFromFile`。
+
+---
+
+## 7. exp6734-B 实测数据(2026-10-01 20:18,对局中 /bt6734b 手动触发)
+
+20 轮 × 64 面板,共 1280 个位元样本;分析脚本 `scripts/exp6734b_analyze.js logs/bridge.log`。
+
+### 7.1 延迟分布(单面板 SetImage → ImageLoaded,dt = nowMs − t0)
+
+| 指标 | 值 |
+| --- | --- |
+| n | 1280 |
+| min | 6 ms |
+| P50 | 173 ms |
+| P90 | 583 ms |
+| P95 | 832 ms |
+| P99 | 1365 ms |
+| MAX | 1399 ms |
+| mean | 255 ms |
+
+- <200ms 占 56.6%,<500ms 占 88.0%,<1000ms 占 95.5%,≥1s 共 57 个(4.5%)
+- 轮间隔(SHOT→SHOT):min 1679 / mean 1919 / max 2899 ms
+
+### 7.2 可靠性对账(游戏侧 vs 服务端)
+
+| 项 | 值 |
+| --- | --- |
+| 游戏侧 LOADED | 1280(20 轮全 64/64,零 TIMEOUT,零 ABORT) |
+| 服务端 BIT 落底(round≥1) | 1344 = 1280 + **64 重复** |
+| gameOnly(游戏有服务端无) | **0** |
+| srvOnly(服务端有游戏无) | **0** |
+| 服务端重复 | 64 个,全部是 round=20 在 20:37:18 **整轮重放**(晚 18 分钟,引擎 image 缓存/重取行为,非协议丢失) |
+
+**判定:位元零丢失、零错位;存在迟到整轮重放 → 协议必须按 (id, round) 幂等去重。**
+
+### 7.3 顺序性
+
+- 服务端跨轮逆序:**0**(轮与轮之间严格有序)
+- 轮内 idx 逆序:游戏侧上报 24 次 / 服务端 25 次(约 1.9% 面板乱序到达)→ **同轮 64 位不可假定按 idx 序到达,必须按 id 定位位值**
+
+### 7.4 吞吐判定(64 面板够不够?)
+
+- **够**。单轮 64 位全到齐的完成时间 = 该轮 max:典型 330 ms(P50 of round-max),最差 1399 ms(R19);20 轮轮 max 中位 ≈ 331 ms
+- 等效吞吐:64 bit / ~0.33 s ≈ **190 bit/s(常态)**,按最差轮 ≈ 46 bit/s;轮间隔 1.5 s 调度下余量 >4×
+- 64 面板一轮即一个 64-bit 字(8 字节),对控制字/短 ID/序号绰绰有余;文本类载荷走 J1 出站(console.log tail,1000 字符零截断)不对称互补
+- 长尾告警:R19 整轮 p50=1337 ms(疑似帧尖峰,同期 frame time 245~256 ms clamped)→ 协议超时窗口按 ≥3 s 设计
+
+---
+
+## 8. exp6734-C 输入框控制实测(2026-10-01 22:57 部署 / 23:13 实测,/bt6734c 手动触发)
+
+目的:验证「发送前翻译」的回填路线 —— 拦截 Enter → 改写 TextEntry.text → 让原版发送链路发出改后文。
+
+### 8.1 C-1 树扫描 / C-2 面板枚举(只读)
+
+- C-1:递归扫 4001 个面板,910 个带 text;`ChatInput found=yes`(id 直达)
+- C-2:`Object.getOwnPropertyNames(ChatInput)` 分 5 片输出,新发现方法面:
+  `SetMaxChars / GetMaxCharCount / GetCursorOffset / SetCursorOffset / ClearSelection / SelectAll / RaiseChangeEvents / SetPanelEvent / RunScriptInPanelContext / WriteCompositionLayerPNG|JPEG` + `Data / SetCompositionLayerTextureName`(写入型)
+
+### 8.2 C-3 只读 / C-4 写+读回(22:57 与 23:13 两轮均绿)
+
+| 项 | 结果 |
+| --- | --- |
+| C-3 只读 | `text="/bt6734c" matchCmd=true` ✅ |
+| C-4 写+读回 | 22:57 `LCTW658489` / 23:13 `LCTW611522`,`write=true match=true` ✅ |
+
+**判定:TextEntry.text 读写闭环成立**(6726 上发送前翻译的回填前提)。
+
+### 8.3 C-5 两段 Enter 发送判定(23:13:33~23:13:38)
+
+流程:布防 → 用户输入 `1` 按 Enter(第1下,拦截改写不发送)→ 输入框变为 `LCTC613953M 1` → 再按 Enter(第2下,走原版发送)→ 观测 chat/lobby/hud 三容器增量行。
+
+| 时刻 | 日志 | 判读 |
+| --- | --- | --- |
+| 23:13:33 | `C3 userText="1"` / `C4 rewrite=true readback="LCTC613953M 1" match=true` | 第1下拦截+改写生效,未发送 |
+| 23:13:35 | `C5 submit#2 raw="LCTC613953M 1" isRewritten=true` → `stock submit dispatched` | 第2下经原版链路发出 |
+| 23:13:35 | `row[chat#36] SENT=MODIFIED text="[队伍] … LCTC613953M 1"` | **服务端回显 = 改后文** |
+| 23:13:38 | `row[chat#37] SENT=ORIGINAL text="1"` | 用户实验后手动补发的第 3 条(已确认),非引擎泄漏 |
+| 23:13:38 | `C5-RESULT BOTH` → 人工判读 | 实际 = **SENT=MODIFIED 成立** |
+
+**判定:引擎发送时读取的就是改写后的 `input.text` → 「拦截→回填→原版链路发送」路线成立。**
+
+- 附带证据:23:13:36 `diag-nav … op=translate&text=LCTC6…` 是**入站翻译拾取了这条新 marker 消息**(核心功能自触发),不是第三次发送;其后 `bridge nav failed` 为面板通道既有抖动,与本实验无关
+- 排除法:钩子第2下只派发一次(仅一条 `submit#2` 日志);`st.orig` 从不被代码发送;`clearInput` 正常 → 多余行只能来自用户手动第 3 下(已确认)
+- 实现要点:hook 必须在 `if (!trimmed)` **之前**调用且出错必放行;布防期 outgoing 翻译分支跳过(`&& !State.c5`)防干扰;第1下 `return true` 吞掉、第2下 `triggerStockSubmit + clearInput`
+
+### 8.4 C 节对协议的意义
+
+发送前翻译的出站链补齐最后一环:J1 文本出站(console.log tail)+ **回填发送(TextEntry 改写)** —— 用户消息可先经桥翻译再由原版链路发出,无需任何已判死的回读口。
+
+---
+
+## 9. 下一步:IPC 协议设计要点
+
+> 2026-10-01 更新:协议冻结前先插 **exp6734-D 下行吞吐基准**(`docs/ipc-downlink-benchmark-6734D.md`)——
+> MAX_SAFE_PAYLOAD / SAFE_WINDOW / FRAME_TIMEOUT 三参数全部由实测表定;本节 6734-B 的 64 面板数据成为 D3 对照组。
+
+位元通道已定案(200=1/非200=0,64 面板并行,~190 bit/s 常态);协议必须的四件事由实测直接推出:
+
+1. **幂等去重**:按 (id, round) 去重(7.2 实测到 18 分钟后整轮重放)
+2. **按 id 定位**:同轮 64 位到达序不可靠(7.3,~1.9% 逆序),位值只由面板 id 决定
+3. **超时 ≥3 s**:最差轮 1399 ms + 帧尖峰余量(7.4)
+4. **request_id 编码**:一轮 = 64 bit = 8 字节,可整轮承载 seq/ack/opcode,乱序由 ID 自纠正
+
+出站文本通道:console.log tail(B 通道)已验证承载聊天文本。双向成型:**J1 文本出站 + J2 位元入站**,不对称但各自带宽充足。
+
+已判死勿再试:`AsyncWebRequest` / `SetURL`(任何 URL) / `title` / 布局尺寸 / `GameInterfaceAPI` / `RSI`(无域钥匙) / `Data()` / `Clipboard` / `BImageFileExists`(非文件 oracle) / **302→src 回读(6733)** / **Image Get*(6734-A)**。
+
+---
+
+## 10. 回滚
+
+```bash
+# mod: 每轮安装前都有备份
+ls addons/pak15_dir.vpk.bak-pre-exp673*   # 选对应轮次恢复到 addons/pak15_dir.vpk
+
+# 桥: git checkout core/bridge_server.js core/config.js config/config.example.json 后重启
+```
+
+---
+
+## 11. BTIPC v1 btipc01 部署(2026-10-02 08:43)
+
+- **规格**:`docs/btipc-v1.md` 十点终审已并入并冻结;实现顺序①~⑤完成,⑥(翻译链)按铁律等回声实车通过后再接;
+- **桥**:`core/btipc/{crc16,framer,window,transport}.js` + `/btipc/dl` 路由 + REQ tail 校验(§14);当前回声模式;桥已重启(health 200,tail 正常);
+- **游戏**:`lingua_chat.js` VERSION=`1.0.7-6726-btipc01`(BTIPC Client + `/bt6736` 回声命令;探针代码未动);
+- **测试**:`tests/btipc/{crc,frame,simulator}.test.js` = 12 + 80 + 12 全绿(含游戏侧内联副本对账 —— 抓过代理对漏 +0x10000 的 emoji bug);全量 51/53(2 红为 quickchat 既有:handshake 指纹漂移 + match 遗留,与 BTIPC 无关);
+- **仿真**(§12.3):100 传输 × 5% 轮级丢包 → 零错字 / 重试率 3.09% / 107.5 bit/s,三门槛全过;风暴强制演练 10/10 DONE;BUSY 前 6 轮 20/20 DONE;
+- **安装**(槽位铁律全流程):pak15_dir.vpk = 391328B(lingua_chat.vjs_c 297.42kb,与 dist 字节一致);备份 `pak15_dir.vpk.bak-pre-btipc01-1002-084351`;
+- **回滚**:`cp addons/pak15_dir.vpk.bak-pre-btipc01-1002-084351 addons/pak15_dir.vpk` + 桥回退重启;
+- **待实车**:进游戏聊天 `/bt6736 20` → `logs/bridge.log` 应见 1× `BTIPC REQ w=..` + 20× `btipc6736: RUN n/n ECHO_OK`、零 FAIL/零 MISMATCH、逐帧 `BTIPC: r=.. seq=.. OK|END`。
+
+---
+
+## 12. btipc02 — crc_dead 根因修复(2026-10-02 09:49)
+
+**实车结果**(btipc01,三轮各 20 连发):`ok=16 fail=4` / `ok=16 fail=4` / 第3轮 6/20 挂,全部 `FAIL kind=crc_dead msg=CRC fail 9x > 8`,单轮耗时 ~25s。失败后立即恢复(下一 `REQ` 是新窗口)。
+
+### 根因 A(桥端,已修,已生效)
+
+`core/btipc/window.js` `END_GC_MS = 10000` **小于客户端最长重试跨度**:
+
+```
+客户端最坏 = T_HARD 12s + 9×(STORM 2.5s + 1s 冷却) ≈ 40s
+桥端却在 END 帧首次被服务后 10s 就删窗
+```
+
+日志抓到现场:
+
+```
+08:53:39[info] BTIPC GC removed=1 remain=1   ← 窗口被删
+08:53:39 BTIPC: r=2 frameFails=8
+08:53:41 BTIPC: r=2 frameFails=9 → crc_dead
+```
+
+删窗后 128 面板全 404 → 全零位 → CRC 必败 → 走满 9 次死线。**这也解释了单轮 ~25s 的耗时**。改 `END_GC_MS = 45000`。
+
+> 附带纠正:先前推测的“新 REQ 未清零 / 状态机泄漏”**不成立** —— `st` 每次 `request()` 全新构造,四个计数器初始化为 0,CRC ok 时归零。日志里 `r=1 OK` 后 `r=2 frameFails=1` 是**新的一次窗口传输**,不是泄漏。
+
+### 根因 B(客户端,已修,已打包)
+
+`mod/panorama/scripts/lingua_chat.js` `tTag` 原为 `&t=win-idHex`,**同 r 重投的 128 个 URL 逐字节相同**,违反 §4「URL 对 (w,r,p) 唯一」。撞同一 URL 时 Panorama 可能不再触发 `ImageLoaded` → `st.fire` 永远为空 → 重试复现同一次失败(对应日志里 `frameFails` 1→9 始终 `seq=-1`)。改为 `&t=win-idHex-roundNo`。
+
+### 测试
+
+新增 `tests/btipc/window_gc.test.js`(4/4),把「`END_GC_MS` > 客户端最坏重试跨度」钉成不变量;该测试在旧值 10s 下会失败,确认能抓回归。全量 **55/57**(51 + 4 新增),2 红仍为 quickchat 既有。
+
+### 安装(槽位铁律全流程)
+
+- 覆盖前确认 pak15 含 lingua 4 文件(裸 `pak15_dir.vpk`,非 DMM 编号文件)✓
+- 备份 `pak15_dir.vpk.bak-pre-btipc02-20261002-094930` ✓
+- 覆盖后 `lingua_chat.vjs_c` 297.42 → **297.64 kb**,391328 → 391551 B,与 `dist/pak01_dir.vpk` `cmp` IDENTICAL ✓
+- 桥已重启(health 200)✓
+
+### 回滚
+
+```bash
+cp addons/pak15_dir.vpk.bak-pre-btipc02-20261002-094930 addons/pak15_dir.vpk
+# 桥:git checkout core/btipc/window.js mod/panorama/scripts/lingua_chat.js && powershell -ExecutionPolicy Bypass -File scripts/restart_bridge.ps1
+```
+
+### 实车验收(2026-10-02 09:55)—— ✅ 通过
+
+```
+btipc6736: ALL DONE n=20 ok=20 fail=0
+```
+
+20/20 `ECHO_OK`,`got="Hello BTIPC"` 逐字节一致,**零 `crc_dead`**。
+
+**决定性证据 = RUN 8**(`w=51ac12`):同一 `r=1` 连败 7 轮(`frameFails=1..7`)→ `STORM enter consec=7` → **`STORM exit`** → `r=1 seq=0 OK` / `r=2 END` → `DONE total=22405ms` → `ECHO_OK`。
+
+- 旧版此窗口在 10s 被 GC 删掉 → 必然 `crc_dead`;新版撑过 22.4s 正常收口 → **根因 A 修复确认**;
+- `STORM exit` 是修复后才可能出现的日志(旧路径永远走不到 CRC ok)。
+
+**根因 B 的正确归因**(先前“面板复用致迟到 ImageLoaded 串轮”的假说**未被证实**,已作废):真实原因是进图加载期(`hero_reveal` 资源加载 + `OnPostPredictionError` 刷屏,同期日志可见)HTTP 队列积压。`t` 加 `roundNo` 使每轮取到全新 URL、不撞引擎缓存,风暴宽收口才能攒够干净的 128 位。回声正确性无缺陷,风暴期只变慢不变错。
+
+**残留(非阻塞)**:风暴期单轮 dt 可达 22s(RUN 8),对 `REQ_TIMEOUT=30s` 余量偏薄。属可靠性余量而非正确性问题;建议在接翻译链(步骤⑥)前按本轮实车 dt 分布重新标定 `T_CLOSE_MS` / 风暴参数。
+
+---
+
+## 13. 步骤⑥ 翻译链接入(2026-10-02)
+
+按“**A:零协议改动**”方案实施。两条传输路径完全分离,共用同一套帧/窗口/重试核心。
+
+### 桥端
+
+- `core/btipc/transport.js`:新增 **`TRQ`** 命令(与 `REQ` **等长**,均为 3 字符命令词 → **不额外占用 §9 J1 的 1000 字节行预算**),解析结果带 `translate:true`;`REQ` 仍为 `translate:false`。TRQ 沿用 REQ 全部 §14.1 校验(CRC/windowId/base64/行长)。
+- `core/bridge_server.js`:`REQ` 保持同步 `setFrames`(回声 conformance 不碰翻译 API);**`TRQ` → `acceptReq(frames=null)` → 客户端立即得 BUSY → 异步 `runTranslate` → `setFrames`**。翻译耗时(100ms~8s/超时)完全落在窗口等待期,**不污染传输状态机**。缓存/自适应学习与 `/api/v1/translate` 同语义;窗口已被 GC/CAN 时 `setFrames` 返回 false → 丢弃。
+- **翻译失败信号**:编成**空 END 帧(len=0)**,协议层零新位段。
+
+### 客户端
+
+- `lingua_chat.js`:`request({..., translate:true})` → 发 `TRQ`。
+- **BUSY 改为同 r 重 poll**(去掉原 `st.r += 1`):BUSY = “本 window DATA 未就绪”,不是新 frame;此时桥端尚未 `setFrames` 故不锚定 `frameStartRound`,待首个 DATA poll 才锚定。
+- **翻译失败 ≠ 成功**:`st.translate && got === ""` → `reject({kind:"translate_error"})`。回声模式**不做**此判定(空串是合法回声)→ echo/translate 语义隔离。
+- 新增 `/bt6737 [text]` 翻译 smoke;`/bt6736` 回声 conformance 保留(回归测试路径不经翻译 API)。
+
+### 验收
+
+- 离线 `tests/btipc/translate.test.js` **10/10**:TRQ 解析、TRQ/REQ 行长逐字节相等、最坏行 ≤1000、§14.1 校验继承、BUSY 不锚定 round、`setFrames` 后首 poll 锚定、空 END 帧语义、**⑥ 未新增任何位段**(BUSY/DATA 帧布局字节级不变)、超 seq7 上限抛错;
+- 全量 **65/67**(55 + 10 新增),2 红仍为既有 quickchat;
+- 桥级 E2E(`scripts/btipc_trq_e2e.js`):真实 tail 写 TRQ → 真 HTTP 轮询 → `TRQ → "你好"` 两轮均 ok(677ms / 1231ms)。
+
+**已知未覆盖**(需实车):E2E 脚本首轮即发,翻译已完成故 `busy=0`,**未观测到 BUSY 等待路径**;长文本/多帧译文与 30s 死线关系也未测。
+
+### 待实车验收(✅ 已于 2026-10-02 13:10~13:12 完成,结果见下)
+
+1. `/bt6736 20` —— 回声回归仍应 `ok=20 fail=0`(确认⑥ 未伤已验收的传输核心);
+2. `/bt6737 hello` —— 应见 `BTIPC TRQ` → 若干 `BUSY` → `DONE` → `btipc6737: OK`,拿到中文译文;
+3. 拿真实聊天译文长度分布,再决定是否需要 response 长度限制 / `REQ_TIMEOUT` 自适应。
+
+### 实车验收结果(2026-10-02 13:10~13:12,VPK `pak15_dir.vpk` SHA256=09ED22A2,桥 1.0.6 + provider=bing)
+
+**① 回声回归 `/bt6736 20`**:`ALL DONE n=20 ok=19 fail=1` —— ✅ 通过(通过口径见下)。
+
+- 19× `ECHO_OK`,dt 2407~3118ms,回声内容全对;
+- 1× FAIL = RUN 14 `kind=crc_dead msg=CRC fail 9x>8 dt=25470`,发生在 13:06:08~13:06:32 进图加载风暴期(`hero_reveal.vnmclip` 密集加载,`STORM enter consec=2 tClose=2500` 已触发但风暴超出 `STORM_ROUNDS=4` 预算);
+- **判为非⑥回归**的三条依据:(a) 同模式 fail 在⑥打包前的 08:52 轮即存在(该轮 `ok=16 fail=4`,失败全是 `crc_dead dt≈25.3s`);(b) 风暴期外对照轮 09:55 `ok=20 fail=0`;(c) ⑥改动只在 TRQ 路径,回声走 `REQ` 同步 `setFrames`,与客户端 STORM/重试状态机无交集。
+
+**② 翻译 smoke `/bt6737`**:6 次全部 `OK`,全链路零失败 —— ✅ 通过。
+
+```
+[game] BTIPC TRQ w=.. text="hello"
+[info] BTIPC TRQ .. (BUSY until translated)     ← BUSY 路径首次实车观测(E2E 未覆盖项,已补上)
+[info] BTIPC TRQ .. ok dt=51ms out=2B frames=1
+[game] BTIPC: r=1 seq=0 len=6 END
+[game] DONE .. frames=1 bytes=6 total=1809ms
+[game] btipc6737: OK win=.. dt=1809ms got="你好"
+```
+
+- BUSY 轮消耗的 r 未污染帧序(`w` 样本:r=1 BUSY ×1 → r=1 seq=0 END),实车验证了 `translate.test.js`「BUSY 期间消耗的 r 不影响帧序」;
+- 空译文/解码正确:`bytes` 与译文 UTF-8 长度逐条吻合。
+
+**③ 译文长度 → 耗时分布**(5 样本,`frames` 全部满足规格 §B 的 `frames = ceil(bytes/10)`):
+
+| 输入(REQ len) | 译文 bytes | frames | total | 各帧 dt | RETRY/CRC |
+|---|---|---|---|---|---|
+| `w`(1) | 1 | 1 | 2964ms(含 BUSY 1 轮 + 翻译 576ms) | 624 | 0 |
+| `hello`(5) | 6 | 1 | 1806ms | 609 | 0 |
+| spirit urn 长句(56) | 45 | **5** | 4739ms | 608~979 | 0 |
+| yellow lane 长句(72) | 63 | **7** | 5749ms | 616~725 | 0 |
+| rotate left 长句(72) | 52 | **6** | 5635ms | 613~1056 | 0 |
+
+- **多帧路径实车通过**:5 帧/6 帧/7 帧三档,`seq=0..N` 递增、末帧 `END` 正确、零 RETRY / 零 CRC / 零 STORM;
+- **耗时模型**(5 样本拟合,残差 <5%):`total ≈ 1200ms 固定开销 + 650~680ms × frames`;桥侧翻译本身 51~576ms(缓存 2ms),**瓶颈是 650ms/帧的轮询**,不是翻译 API;
+- **30s 死线余量**:`REQ_TIMEOUT=30000` 对应 ≈44 帧 ≈ 440 字节(≈147 汉字)的译文上限;实测最长 7 帧 / 63 字节 / 5.7s,余量充足。
+
+**结论**:`REQ_TIMEOUT=30s` 维持不变,**暂不加 response 长度限制**。触发条件与兜底路径已存在(超 44 帧/440B 才会逼近死线,桥侧超时由 §13 既有 `kind:'timeout'` 降级路径接住),留待真实游戏聊天出现超长译文再按数据复议;帧长 10B 是协议 §B 冻结位段,改它 = 改协议,不为假想需求动冻结面。
+
+**观察项(非阻塞)**:两条长输入均被截在恰好 **72 字符**(`walker b` / `going t` 处断),截断发生在 `/bt6737` 处理器上游(客户端 handler 只有 `text.slice(0,60)` 用于打日志,mod 内无 72 上限)→ 疑为游戏聊天输入框自身的 TextEntry 上限,待单独确认;若确认,则线上真实输入 ≤72 字符,译文帧数天然 ≤ ~10 帧,死线更宽松。

@@ -15,7 +15,7 @@
   "use strict";
 
   const LOG_PREFIX = "[LCT]";
-  const VERSION = "1.0.3";
+  const VERSION = "1.0.7-6726-btipc01"; // BTIPC v1 回声客户端(聊天命令 /bt6736;规格 docs/btipc-v1.md);前版 1.0.7-6726-exp6734E
 
   // ---- 原版聊天结构 ID(当前 Deadlock 版本稳定)----
   const CHAT_ROOT_ID = "Chat";
@@ -61,7 +61,8 @@
   const FAST_POLL_SECONDS = 0.4;
   const SLOW_POLL_SECONDS = 1.0;
   const BOOTSTRAP_TAIL_SCAN_LIMIT = 24; // 首次只扫末尾,避免翻历史
-  const LOW_LATENCY_TAIL_SCAN_LIMIT = 3; // 每次额外扫末尾,保证低延迟
+  const LOW_LATENCY_TAIL_SCAN_LIMIT = 6; // 每次额外扫末尾,保证低延迟(6726 气泡先建文本后填,burst>窗口时靠观察表兕底)
+  const PENDING_FILL_TTL_MS = 5000; // 6726:空行观察窗 TTL(气泡先建、文本延迟填充;超时移除防空行永久占用)
   const HUD_OVERLAY_LIMIT = 10; // HUD 译文浮层上限(超过则清理最旧,防内存泄漏)
   const TITLE_POLL_SECONDS = 0.3;
   const BRIDGE_ALIVE_SECONDS = 1.5;
@@ -81,7 +82,11 @@
   const UNKNOWN_NAME = "<unknown>";
 
   // ---- 本地桥 ----
-  const BRIDGE_HOST = "localhost"; // 用 localhost 而非 127.0.0.1:当前 Deadlock 版本 HTML 面板(SetURL)对 http://127.0.0.1 本地回环拦截,仅放行 localhost
+  // HOST 时机线:2026-08-25 版拦截 http://127.0.0.1 仅放行 localhost → 改用 localhost;
+  // 2026-09-30 游戏更新(6726)后反向:拦截 localhost,SetURL 到 http://localhost 被静默忽略
+  // (诊断证实 panel.title 恒空、src="",页面从未加载),而 127.0.0.1 正常(DeadlockLingua 1.0.1 验证)。
+  // 改回 127.0.0.1;桥已双栈监听(127.0.0.1+::1),两种解析都能命中。
+  const BRIDGE_HOST = "127.0.0.1";
   const BRIDGE_PORT = 8791; // 与 core/config.json 保持一致
   const TITLE_PREFIX = "LCT";
   const TITLE_ALIVE = "lct-alive";
@@ -294,6 +299,7 @@
     gamenamesLoaded: false, // 启动后是否已从桥拉取过游戏名保护名单(healthCheck 补触发用)
     gamenamesLoading: false, // 名单拉取是否进行中(防 healthCheck 重复触发叠加)
     seen: new Set(), // 消息签名去重
+    pendingFill: new Map(), // 6726 延迟填充观察表:rowPanel -> 过期时间戳(空行文本后补,补齐后自动出表)
     cache: new Map(), // textKey(归一化文本+目标语言) -> { translation, fragment }
     inflight: new Map(), // textKey -> 在途合并组 { key, rows, settled }:同文本只发一次桥请求,结果扇出所有同文行
     queue: [], // 待翻译任务
@@ -310,6 +316,8 @@
     cfg: null, // 游戏侧 UI 配置
     bridgeUp: false, // 桥在线标记(health 探测维护)
     bridgeOfflineSince: 0,
+    diagTitleCount: 0, // DIAG-6726:标题轮询诊断计数
+    panelActivated: false, // EXP-6726b:面板已置可见/激活标记
     canHttp: null, // 直连通道(AsyncWebRequest)可用性,启动后探测一次;null=未探测
     logBuffer: [], // 聊天日志缓冲(批量推送到桥)
     logFlushing: false,
@@ -2090,6 +2098,145 @@ function injectTranslation(row, sig, text, fragment) {
       return;
     }
     ensureBridgeEvents();
+    // EXP-6726b:疑似新引擎不为“不可见/非激活”面板加载网页(诊断 act=0 且页面从未加载)。
+    // 导航前把面板置为可见 + 尝试激活;首次成功后保持(不反复切换)。
+    try { panel.visible = true; } catch (e) {}
+    try { panel.style.opacity = "1"; } catch (e) {}
+    if (!State.panelActivated) {
+      State.panelActivated = true;
+      try { if (typeof panel.Activate === "function") panel.Activate(); } catch (e) {}
+      try { if (typeof panel.SetFocus === "function") panel.SetFocus(); } catch (e) {}
+      try { panel.RemoveClass("LCTBridgePanel"); panel.AddClass("LCTBridgePanelActive"); } catch (e) {}
+      log("diag-activate: panel made visible/active before nav");
+      // 枚举面板可用方法(一次性,看 6726 是否有新导航 API);分两段避免单行过长
+      try {
+        const names = [];
+        for (const k in panel) {
+          try { names.push(k + ":" + typeof panel[k]); } catch (e2) {}
+        }
+        log("diag-panel-props: " + names.slice(0, 70).join(", "));
+        log("diag-panel-props2: " + names.slice(70, 160).join(", "));
+        log("diag-panel-props3: " + names.slice(160).join(", "));
+      } catch (e) {}
+      // EXP-6726d-1:枚举全局 $,找 6726 可能新增的 HTTP API(AsyncWebRequest 替代品)
+      try {
+        const g = [];
+        try { for (const k in $) { g.push(k + ":" + typeof $[k]); } } catch (e0) {}
+        if (!g.length && typeof Object.getOwnPropertyNames === "function") {
+          const ks = Object.getOwnPropertyNames($);
+          for (let i = 0; i < ks.length; i += 1) { try { g.push(ks[i] + ":" + typeof $[ks[i]]); } catch (e1) {} }
+        }
+        log("diag-globals: " + g.slice(0, 100).join(", "));
+        log("diag-globals2: " + g.slice(100, 200).join(", "));
+        log("diag-globals3: " + g.slice(200).join(", "));
+      } catch (e) { log("diag-globals failed: " + (e && e.message ? e.message : String(e))); }
+      // EXP-6726d-2:ready-events 实验 — 新引擎可能要求面板 ready 后才接受外部导航;
+      // ready 回调触发后立即 SetURL(/bridge?id=r0,health),桥日志若出现该请求 = 导航恢复
+      try {
+        if (typeof panel.RegisterForReadyEvents === "function") {
+          panel.RegisterForReadyEvents(function () {
+            let rd = "throw";
+            try { rd = String(panel.BReadyForDisplay()); } catch (e) {}
+            log("diag-ready: ready event fired; BReadyForDisplay=" + rd);
+            try { panel.SetReadyForDisplay(true); } catch (e) {}
+            try {
+              panel.SetURL("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/bridge?id=r0&op=health&d=%7B%7D");
+              log("diag-ready: SetURL after ready sent (watch bridge log for id=r0)");
+            } catch (e2) {
+              log("diag-ready: SetURL after ready threw: " + (e2 && e2.message ? e2.message : String(e2)));
+            }
+          });
+          log("diag-ready: RegisterForReadyEvents registered");
+        } else {
+          log("diag-ready: RegisterForReadyEvents unavailable");
+        }
+      } catch (e) { log("diag-ready failed: " + (e && e.message ? e.message : String(e))); }
+      // EXP-6726e:AsyncWebRequest 函数仍在全局 $ 里但探测失败 — 逐变体记录返回值/异常找真相
+      try {
+        const AWR = $.AsyncWebRequest;
+        try { log("diag-awr: length=" + AWR.length + " name=" + (AWR.name || "?")); } catch (eA) {}
+        try {
+          const r1 = $.AsyncWebRequest("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/api/v1/health", { type: "GET", timeout: 3000 });
+          log("diag-awr v1: typeof=" + typeof r1 + " ctor=" + (r1 && r1.constructor ? r1.constructor.name : "-") + " str=" + String(r1).slice(0, 80));
+          if (r1 && typeof r1.then === "function") {
+            r1.then(function (v) { log("diag-awr v1 resolved: " + String(v).slice(0, 100)); }, function (er) { log("diag-awr v1 rejected: " + String(er).slice(0, 120)); });
+          }
+        } catch (e1) { log("diag-awr v1 threw: " + (e1 && e1.message ? e1.message : String(e1))); }
+        try {
+          const r2 = $.AsyncWebRequest("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/api/v1/health");
+          log("diag-awr v2: typeof=" + typeof r2 + " str=" + String(r2).slice(0, 80));
+        } catch (e2) { log("diag-awr v2 threw: " + (e2 && e2.message ? e2.message : String(e2))); }
+        try {
+          const r3 = $.AsyncWebRequest("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/api/v1/health", { type: "GET", success: function (v) { log("diag-awr v3 success: " + String(v).slice(0, 80)); }, error: function (er) { log("diag-awr v3 error: " + String(er).slice(0, 80)); } });
+          log("diag-awr v3: typeof=" + typeof r3);
+        } catch (e3) { log("diag-awr v3 threw: " + (e3 && e3.message ? e3.message : String(e3))); }
+        try {
+          const r4 = $.AsyncWebRequest("https://httpbin.org/get", { type: "GET", timeout: 5000 });
+          if (r4 && typeof r4.then === "function") {
+            r4.then(function (v) { log("diag-awr v4 resolved: " + String(v).slice(0, 100)); }, function (er) { log("diag-awr v4 rejected: " + String(er).slice(0, 120)); });
+          } else { log("diag-awr v4: typeof=" + typeof r4); }
+        } catch (e4) { log("diag-awr v4 threw: " + (e4 && e4.message ? e4.message : String(e4))); }
+      } catch (e0) { log("diag-awr failed: " + (e0 && e0.message ? e0.message : String(e0))); }
+      // EXP-6726f:Image 面板远程加载探针 — JS 侧最后的网络 I/O 残留路径。
+      // 动态建 Image 面板 SetImage(桥 /test.png?id=f1),桥日志出现 IMG-HIT 即通道活;
+      // 同时给 HTML 桥面板也发一次(它若连图都不加载 = 网络栈彻底禁用)
+      try {
+        const imgUrl = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/test.png?id=f" + (State.imgProbeCount = (State.imgProbeCount || 0) + 1);
+        let imgPanel = null;
+        try { imgPanel = findChild(getRoot(), "LCTImgProbe"); } catch (eI0) {}
+        if (!isValid(imgPanel)) {
+          try { imgPanel = $.CreatePanel("Image", getRoot(), "LCTImgProbe"); } catch (eI1) {}
+          if (isValid(imgPanel)) { try { imgPanel.visible = false; imgPanel.style.width = "2px"; imgPanel.style.height = "2px"; } catch (eI2) {} }
+        }
+        if (isValid(imgPanel) && typeof imgPanel.SetImage === "function") {
+          try { imgPanel.SetImage(imgUrl); log("diag-img: SetImage sent -> " + imgUrl); } catch (eI3) { log("diag-img: SetImage threw: " + (eI3 && eI3.message ? eI3.message : String(eI3))); }
+        } else { log("diag-img: Image panel unavailable" + (imgPanel ? " (no SetImage)" : "")); }
+        try {
+          const hp = ensurePanel();
+          if (isValid(hp) && typeof hp.SetImage === "function") { hp.SetImage(imgUrl); log("diag-img: html-panel SetImage sent"); }
+        } catch (eI4) {}
+      } catch (eI) { log("diag-img failed: " + (eI && eI.message ? eI.message : String(eI))); }
+      // EXP-6726g→h:尺寸回读探针。g 结论:visible=false 时布局恒 0(不可见面板不参与布局);
+      // h 修正:面板完全可见 + 零尺寸样式,读 6 个布局指标。若仍 0 = 引擎不用固有尺寸布局,尺寸信道不通
+      try {
+        let dimPanel = findChild(getRoot(), "LCTDimProbe");
+        if (!isValid(dimPanel)) {
+          try { dimPanel = $.CreatePanel("Image", getRoot(), "LCTDimProbe"); } catch (eD1) {}
+          // h:不做任何隐藏/样式处理 — 可见、无 width/height,左上角短暂出现 133x77 黑块可接受(探针)
+        }
+        if (isValid(dimPanel)) {
+          State.dimPoll = (State.dimPoll || 0) + 1;
+          const myPoll = State.dimPoll;
+          try { dimPanel.SetImage("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/dim.png?id=h" + myPoll); } catch (eD3) {}
+          log("diag-dim: SetImage sent (poll #" + myPoll + ", visible panel)");
+          let samples = 0;
+          const readDim = function () {
+            if (myPoll !== State.dimPoll) return;
+            samples += 1;
+            try {
+              const parts = [
+                "aw=" + dimPanel.actuallayoutwidth,
+                "ah=" + dimPanel.actuallayoutheight,
+                "cw=" + dimPanel.contentwidth,
+                "ch=" + dimPanel.contentheight,
+                "dw=" + dimPanel.desiredlayoutwidth,
+                "dh=" + dimPanel.desiredlayoutheight,
+              ];
+              log("diag-dim #" + samples + ": " + parts.join(" ") + " (target 133x77)");
+            } catch (eD5) { log("diag-dim #" + samples + ": read threw"); }
+            if (samples <= 30) {
+              try { $.Schedule(0.2, readDim); } catch (eD6) {}
+            } else {
+              log("diag-dim: done (30 samples)");
+              try { dimPanel.visible = false; } catch (eD7) {}
+            }
+          };
+          try { $.Schedule(0.2, readDim); } catch (eD7) { log("diag-dim: Schedule unavailable"); }
+        } else {
+          log("diag-dim: panel unavailable");
+        }
+      } catch (eD) { log("diag-dim failed: " + (eD && eD.message ? eD.message : String(eD))); }
+    }
     // 出站翻译超时计时从此刻(开始处理)算起;排队等待不计入
     if (job.kind === "outgoing") {
       // Panorama 无标准 setTimeout(8/6 崩溃根因),用 $.Schedule(单位秒);done 有 once 保护,超时与结果谁先到谁生效
@@ -2109,6 +2256,11 @@ function injectTranslation(row, sig, text, fragment) {
     setPending(job.id, function (payload) {
       handleBridgePayload(job, payload);
     }, job.kind === "outgoing" ? OUTGOING_TIMEOUT_MS : (State.cfg.timeoutMs || 15000));
+    // DIAG-6726:记录每次导航目标(去 query 串,避免刷长文本),确认请求确实发出
+    State.diagNavCount = (State.diagNavCount || 0) + 1;
+    if (State.diagNavCount <= 5 || State.diagNavCount % 20 === 0) {
+      log("diag-nav #" + State.diagNavCount + " -> " + String(url.split("?")[0] || "") + " (q=" + String(url.split("?")[1] || "").slice(0, 30) + "...)");
+    }
     try {
       panel.SetURL(url);
     } catch (e) {
@@ -2300,6 +2452,22 @@ function injectTranslation(row, sig, text, fragment) {
     log("bridge events registered");
   }
 
+  // ---- 诊断（DIAG-6726）：面板状态快照，用于区分“页面没加载”与“加载了但标题读不到”
+  function navDiagSnapshot(verbose) {
+    const panel = State.panel;
+    if (!isValid(panel)) return "panel=invalid";
+    let bits = [];
+    try { bits.push("title(" + typeof panel.title + ")=" + JSON.stringify(String(panel.title || "").slice(0, 40))); } catch (e) { bits.push("title=throw"); }
+    try { bits.push("act=" + (panel.IsActive ? "1" : "0")); } catch (e) {}
+    try { bits.push("loadFail=" + String(panel.loadfailure)); } catch (e) {}
+    try { bits.push("src=" + JSON.stringify(String(panel.src || panel.url || "").slice(0, 60))); } catch (e) {}
+    if (verbose) {
+      try { bits.push("SetURL=" + (typeof panel.SetURL === "function" ? "yes" : "no")); } catch (e) {}
+      try { bits.push("ready=" + String(panel.BReadyForDisplay())); } catch (e) { bits.push("ready=throw"); }
+    }
+    return bits.length ? bits.join(" ") : "panel=valid(no-detail)";
+  }
+
   function markBridgeUp() {
     if (!State.bridgeUp) {
       State.bridgeUp = true;
@@ -2406,6 +2574,30 @@ function injectTranslation(row, sig, text, fragment) {
     $.Schedule(TITLE_POLL_SECONDS, pollTitle);
   }
 
+  // ---- 诊断(DIAG-6726):2026-09-30 游戏更新(6726 版)后面板导航全失败,
+  // 需区分 A) 页面真没加载(panel.title 恒空) B) 页面加载了但标题变化读不到(title 一直 'lct-bridge')。
+  // 每 20 次轮询采样一次 panel.title/属性/有效性,避免刷屏。
+  function diagTitlePoll() {
+    State.diagTitleCount += 1;
+    if (State.diagTitleCount % 20 !== 1) return;
+    const panel = State.panel;
+    const bits = ["#" + State.diagTitleCount, "valid=" + (isValid(panel) ? "1" : "0"), "dead=" + (State.panelDead ? "1" : "0")];
+    if (isValid(panel)) {
+      let tType = "unknown";
+      let tVal = "";
+      try { tType = typeof panel.title; if (tType === "string") tVal = panel.title; } catch (e) { tType = "throw"; }
+      bits.push("title(" + tType + ")=" + JSON.stringify(String(tVal || "").slice(0, 40)));
+      try {
+        const attr = panel.GetAttributeString ? panel.GetAttributeString("title", "") : "";
+        bits.push("attr=" + JSON.stringify(String(attr || "").slice(0, 40)));
+      } catch (e) {}
+      try { bits.push("src=" + JSON.stringify(String(panel.src || panel.url || "").slice(0, 60))); } catch (e) {}
+      try { bits.push("act=" + (panel.IsActive ? "1" : "0")); } catch (e) {}
+      try { bits.push("loadFail=" + String(panel.loadfailure)); } catch (e) {}
+    }
+    log("diag-title " + bits.join(" "));
+  }
+
   function readBridgeTitle() {
     const panel = State.panel;
     if (!isValid(panel)) return null;
@@ -2430,6 +2622,7 @@ function injectTranslation(row, sig, text, fragment) {
     State.polling = false;
     const pending = State.pending;
     if (!pending) return;
+    diagTitlePoll();
     const title = readBridgeTitle();
     if (title === TITLE_ALIVE) {
       markBridgeUp();
@@ -2451,7 +2644,7 @@ function injectTranslation(row, sig, text, fragment) {
     if (!pending.sawAlive && nowMs() - pending.startedAt > BRIDGE_ALIVE_SECONDS * 1000) {
       State.pending = null;
       State.panelDead = true;
-      log("bridge nav failed: panel dead (no lct-alive within " + BRIDGE_ALIVE_SECONDS + "s)");
+      log("bridge nav failed: panel dead (no lct-alive within " + BRIDGE_ALIVE_SECONDS + "s) | " + navDiagSnapshot());
       pending.onResult({ ok: false, error: "bridge_nav_failed" });
       return;
     }
@@ -2473,6 +2666,7 @@ function injectTranslation(row, sig, text, fragment) {
     if (State.panelWarned) return;
     State.panelWarned = true;
     log("bridge offline: 请先启动 core/bridge_server.js(或 StartDeadlock.bat)");
+    log("diag-panel " + navDiagSnapshot(true));
     setStatus(t("bridgeOffline"));
     updateBridgeStatusUI();
     updateBridgeDot();
@@ -2904,7 +3098,19 @@ function injectTranslation(row, sig, text, fragment) {
   function processRow(row) {
     if (!isValid(row)) return false;
     const record = readMessageRow(row);
-    if (!record) return false;
+    if (!record) {
+      // 6726 新行为:气泡先创建、文本延迟填充(用户肉眼可见)。空行在此返回 null,
+      // 若只靠水位线+尾部补扫,burst 超 3 条后填充的文本会永久漏译 → 登记观察表,文本到达后由补扫处理
+      if (!row.__lctWatched) {
+        row.__lctWatched = true;
+        try { State.pendingFill.set(row, nowMs() + PENDING_FILL_TTL_MS); } catch (e) {}
+      }
+      return false;
+    }
+    if (row.__lctWatched) {
+      row.__lctWatched = false;
+      try { State.pendingFill.delete(row); } catch (e) {}
+    }
     // 诊断探针1:读到的 quick 行(去重防刷屏,上限 200 条重置)
     if (record.quick) {
       const dkey = (record.hud ? "H\x00" : "C\x00") + (record.text || "");
@@ -3120,13 +3326,32 @@ function injectTranslation(row, sig, text, fragment) {
     return touched;
   }
 
+  // 6726 延迟填充观察表:每轮复扫登记的空行;文本到达 → processRow 正常走全管线;
+  // 行失效(回收/销毁)或超时 → 出表。空行不会污染 seen/processed(在签名逻辑之前拦截),表内循环无泄漏
+  function processPendingFill() {
+    if (State.pendingFill.size === 0) return false;
+    const now = nowMs();
+    let touched = false;
+    const dead = [];
+    State.pendingFill.forEach(function (expireAt, row) {
+      if (!isValid(row) || now > expireAt) { dead.push(row); return; }
+      try {
+        if (processRow(row)) touched = true;
+        if (!row.__lctWatched) dead.push(row); // 文本已到达并被处理,出表
+      } catch (e) { dead.push(row); }
+    });
+    for (let i = 0; i < dead.length; i += 1) State.pendingFill.delete(dead[i]);
+    return touched;
+  }
+
   function scanChatMessages() {
     // 注意:两个扫描都必须执行,不能用 || 短路——
     // 左下角聊天有活动时 scanChatMessagesOnce() 返回 true 会跳过 HUD 扫描
     const touchedChat = scanChatMessagesOnce();
     const touchedHud = scanHudTopBarOnce();
     const touchedLobby = scanLobbyOnce();
-    const touched = touchedChat || touchedHud || touchedLobby;
+    const touchedFill = processPendingFill();
+    const touched = touchedChat || touchedHud || touchedLobby || touchedFill;
     const hasWork = touched || State.queue.length > 0 || State.pending;
     $.Schedule(hasWork ? FAST_POLL_SECONDS : SLOW_POLL_SECONDS, scanChatMessages);
   }
@@ -3206,6 +3431,422 @@ function injectTranslation(row, sig, text, fragment) {
   }
 
   // 统一提交处理;带防重(函数调用 + 事件监听双通道可能同时触发)
+  // ============ BTIPC v1 客户端(规格 docs/btipc-v1.md;实现顺序④)=============
+  // 固定窗口收包:128 个隐藏 Image 面板轮询 /btipc/dl,位=1→200(火焰)/位=0→404;
+  // 每轮 16 字节帧 → 内联 CRC16 校验 → 按 seq 拼装。无 ACK:r 前进即确认,同 r 重投即重传(§4.0)。
+  // API(§7 冻结 Promise 形):BTIPC.request({windowId, text, timeoutMs}) → Promise<文本>。
+  // 当前回声模式(桥端③已就);⑥接翻译链后调用方不变。Panorama 无模块系统,crc16/decode 内联(§3.2 逐字节一致)。
+  const BTIPC_PANEL_PREFIX = "BTIPCD"; // 0..127;与 BTBIT*/BTD*/BTE* 探针严格隔离
+  const BTIPC_PANELS = 128;
+  const BTIPC_FRAME_BYTES = 16;
+  const BTIPC_PAYLOAD_MAX = 10;
+  const BTIPC_T_CLOSE_MS = 600; // §9 常态收口(新 build bit dt P99.9 ≈ 522ms)
+  const BTIPC_STORM_TCLOSE_MS = 2500; // §9 风暴收口
+  const BTIPC_STORM_TRIGGER = 2; // 连续 CRC fail 轮数 → 风暴(§4.1)
+  const BTIPC_STORM_ROUNDS = 4; // 风暴持续轮数
+  const BTIPC_BUSY_BACKOFF_MS = 500; // BUSY 退避
+  const BTIPC_T_HARD_MS = 12000; // 轮级强制闭合兜底(§4)
+  const BTIPC_REQ_TIMEOUT_MS = 30000; // 消息级死线(§9)
+  const BTIPC_CRC_DEAD = 8; // 同帧累计 fail 上限(§7)
+  const BTIPC_REQ_MAX_PAYLOAD = 680; // §9:整行(引擎前缀+[LCT]+行头+b64 908)≤1000(J1);68 帧 ≤ seq7 上限
+  const BTIPC_FIRST_SHOT_DELAY_MS = 1200; // 首拍延迟:桥 tail 轮询 1000ms,防首批全 404 误触风暴
+
+  // ---- 内联 CRC-16/CCITT-FALSE(与 core/btipc/crc16.js 逐字节一致) ----
+  function btipcCrc16(bytes) {
+    let crc = 0xffff;
+    for (let i = 0; i < bytes.length; i += 1) {
+      crc ^= (bytes[i] & 0xff) << 8;
+      for (let b = 0; b < 8; b += 1) {
+        crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) : crc << 1;
+        crc &= 0xffff;
+      }
+    }
+    return crc;
+  }
+
+  // ---- 16 字节帧解码(§3.2):CRC 不过直接拒,绝不返回半可信数据 ----
+  function btipcDecodeFrame(b) {
+    if (!b || b.length !== BTIPC_FRAME_BYTES) return { ok: false, reason: "size" };
+    const input = [];
+    for (let i = 0; i < 4; i += 1) input.push(b[i]);
+    for (let i = 6; i < 16; i += 1) input.push(b[i]); // CRC 覆盖 B0..B3 + B6..B15(固定 14B,含填充)
+    const calc = btipcCrc16(input);
+    const got = ((b[4] & 0xff) << 8) | (b[5] & 0xff);
+    if (calc !== got) return { ok: false, reason: "crc" };
+    const valid = (b[3] & 0x80) !== 0;
+    const len = b[3] & 0x7f;
+    if (len > BTIPC_PAYLOAD_MAX) return { ok: false, reason: "format" };
+    if (!valid && (b[0] !== 0 || b[3] !== 0)) return { ok: false, reason: "format" }; // BUSY 固定帧
+    const payload = [];
+    for (let i = 0; i < len; i += 1) payload.push(b[6 + i]);
+    return {
+      ok: true, valid: valid, seq: b[0] & 0x7f, end: (b[0] & 0x80) !== 0,
+      id: ((b[1] & 0xff) << 8) | (b[2] & 0xff), len: len, payload: payload,
+    };
+  }
+
+  // ---- UTF-8 字节 → 字符串(引擎无 TextDecoder) ----
+  function btipcUtf8Decode(bytes) {
+    let out = "";
+    let i = 0;
+    while (i < bytes.length) {
+      const c = bytes[i];
+      let cp = 0, extra = 0;
+      if (c < 0x80) { cp = c; extra = 0; }
+      else if ((c & 0xe0) === 0xc0) { cp = c & 0x1f; extra = 1; }
+      else if ((c & 0xf0) === 0xe0) { cp = c & 0x0f; extra = 2; }
+      else if ((c & 0xf8) === 0xf0) { cp = c & 0x07; extra = 3; }
+      else { out += "\ufffd"; i += 1; continue; }
+      let cont = true;
+      for (let k = 1; k <= extra; k += 1) {
+        const cc = bytes[i + k];
+        if (cc === undefined || (cc & 0xc0) !== 0x80) { cont = false; break; }
+        cp = (cp << 6) | (cc & 0x3f);
+      }
+      if (!cont) { out += "\ufffd"; i += 1; continue; }
+      i += extra + 1;
+      if (cp > 0x10ffff) { out += "\ufffd"; continue; }
+      if (cp < 0x10000) out += String.fromCharCode(cp);
+      else {
+        const v = cp - 0x10000;
+        out += String.fromCharCode(0xd800 + (v >> 10), 0xdc00 + (v & 0x3ff));
+      }
+    }
+    return out;
+  }
+
+  // ---- UTF-8 字符串 → 字节(REQ payload;代理对按码点展开) ----
+  function btipcUtf8Bytes(str) {
+    const out = [];
+    for (let i = 0; i < str.length; i += 1) {
+      let cp = str.charCodeAt(i);
+      if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < str.length) {
+        const lo = str.charCodeAt(i + 1);
+        if (lo >= 0xdc00 && lo <= 0xdfff) { cp = 0x10000 + (((cp - 0xd800) << 10) | (lo - 0xdc00)); i += 1; }
+      }
+      if (cp < 0x80) out.push(cp);
+      else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 63));
+      else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+    }
+    return out;
+  }
+
+  // ---- 字节 → base64(引擎无 btoa;REQ 行用) ----
+  function btipcBase64(bytes) {
+    const tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      const b0 = bytes[i];
+      const b1 = bytes[i + 1];
+      const b2 = bytes[i + 2];
+      out += tbl[b0 >> 2];
+      out += tbl[((b0 & 3) << 4) | ((b1 === undefined ? 0 : b1) >> 4)];
+      out += b1 === undefined ? "=" : tbl[((b1 & 15) << 2) | ((b2 === undefined ? 0 : b2) >> 6)];
+      out += b2 === undefined ? "=" : tbl[b2 & 63];
+    }
+    return out;
+  }
+
+  // ---- 面板池(128 个隐藏 2×2,复用;创建不全时下次调用重建) ----
+  function btipcPanels() {
+    if (State.btipcPanels && State.btipcPanels.length === BTIPC_PANELS) return State.btipcPanels;
+    const arr = [];
+    for (let i = 0; i < BTIPC_PANELS; i += 1) {
+      const pid = BTIPC_PANEL_PREFIX + i;
+      let p = null;
+      try { p = findChild(getRoot(), pid); } catch (e) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), pid); } catch (e) {}
+        if (isValid(p)) {
+          try { p.visible = false; p.style.width = "2px"; p.style.height = "2px"; } catch (e) {}
+        }
+      }
+      if (isValid(p)) arr.push(p);
+    }
+    State.btipcPanels = arr;
+    return arr;
+  }
+
+  // ---- ImageLoaded 每会话注册一次;只认 BTIPCD* 前缀(探针 BTD*/BTBIT*/BTE* 互不干扰) ----
+  function btipcEnsureHandler() {
+    if (State.btipcHandlerOn) return;
+    State.btipcHandlerOn = true;
+    try {
+      $.RegisterForUnhandledEvent("ImageLoaded", function (panel) {
+        const st = State.btipcActive;
+        if (!st || !st.roundOpen) return;
+        let pid = "";
+        try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+        if (pid.slice(0, 6) !== BTIPC_PANEL_PREFIX) return;
+        const p = parseInt(pid.slice(6), 10);
+        if (isNaN(p) || p < 0 || p >= BTIPC_PANELS) return;
+        st.fire[p] = 1; // 同轮同面板重复 fire 幂等;上一轮迟到的 straggler 只能撞 CRC 重试(§1)
+      });
+    } catch (e) { log("btipc: ImageLoaded handler THREW " + expErr(e)); }
+  }
+
+  // ---- SHOT:一轮 128 发(§4);URL 对 (w,r,p) 唯一,t = 窗口号-请求号兼缓存击穿 ----
+  function btipcShot(st) {
+    if (State.btipcActive !== st) return;
+    const panels = btipcPanels();
+    if (panels.length < BTIPC_PANELS) {
+      btipcFinish(st, false, { kind: "bridge_down", message: "panels " + panels.length + "/" + BTIPC_PANELS });
+      return;
+    }
+    st.fire = {};
+    st.roundOpen = true;
+    st.roundNo += 1;
+    st.shotAt = nowMs();
+    const urlBase = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/btipc/dl?w=" + st.win + "&r=" + st.r;
+    // t = 窗口号-请求号-轮次。必须含 roundNo:否则同 r 重投的 128 个 URL 逐字节相同,
+    // SetImage 撞同一 URL 可能不再触发 ImageLoaded → fire 永远为空 → 重试复现同一次失败(§4 要求 URL 唯一)。
+    const tTag = "&t=" + st.win + "-" + st.idHex + "-" + st.roundNo;
+    for (let i = 0; i < BTIPC_PANELS; i += 1) {
+      try { panels[i].SetImage(urlBase + "&p=" + i + tTag); } catch (e) {}
+    }
+    const tClose = st.stormRounds > 0 ? BTIPC_STORM_TCLOSE_MS : BTIPC_T_CLOSE_MS;
+    const myR = st.r;
+    const myNo = st.roundNo;
+    try {
+      $.Schedule(tClose / 1000, function () { btipcClose(st, myR, myNo); });
+      $.Schedule(BTIPC_T_HARD_MS / 1000, function () { btipcClose(st, myR, myNo); }); // T_HARD 兜底(守卫保证只生效一次)
+    } catch (e) {
+      btipcFinish(st, false, { kind: "bridge_down", message: "schedule THREW " + expErr(e) });
+    }
+  }
+
+  // ---- 闭合判定(§4.0 判定表写死) ----
+  function btipcClose(st, myR, myNo) {
+    if (State.btipcActive !== st) return;
+    if (!st.roundOpen || st.r !== myR || st.roundNo !== myNo) return; // 已被更早的闭合推进
+    st.roundOpen = false;
+
+    // 128 bit → 16 字节(§3.1 LSB first)
+    const bytes = [];
+    for (let i = 0; i < BTIPC_FRAME_BYTES; i += 1) bytes.push(0);
+    for (let p = 0; p < BTIPC_PANELS; p += 1) {
+      if (st.fire[p]) bytes[p >> 3] |= 1 << (p & 7);
+    }
+    const dt = nowMs() - st.shotAt;
+    let d = btipcDecodeFrame(bytes);
+    if (d.ok && d.id !== st.id) d = { ok: false, reason: "id_mismatch got=" + d.id }; // 防缓存串窗
+
+    if (!d.ok) {
+      st.frameFails += 1;
+      st.consecutiveFails += 1;
+      log("BTIPC: r=" + st.r + " seq=-1 len=-1 dt=" + dt + " RETRY crc=" + d.reason +
+          " frameFails=" + st.frameFails + " consec=" + st.consecutiveFails);
+      if (st.frameFails > BTIPC_CRC_DEAD) {
+        btipcFinish(st, false, { kind: "crc_dead", message: "CRC fail " + st.frameFails + "x > " + BTIPC_CRC_DEAD });
+        return;
+      }
+      let entered = false;
+      if (st.consecutiveFails >= BTIPC_STORM_TRIGGER && st.stormRounds <= 0) {
+        st.stormRounds = BTIPC_STORM_ROUNDS;
+        entered = true;
+        log("BTIPC: STORM enter consec=" + st.consecutiveFails + " tClose=" + BTIPC_STORM_TCLOSE_MS + " rounds=" + BTIPC_STORM_ROUNDS);
+      }
+      const stormNow = st.stormRounds > 0;
+      if (stormNow && !entered) st.stormRounds -= 1; // 进入当轮不减,保证宽收口正好 4 轮
+      // 同 r 重投(§4.0);风暴期轮间 1s 冷却
+      try {
+        $.Schedule(stormNow ? 1.0 : 0.1, function () { btipcShot(st); });
+      } catch (e) { btipcFinish(st, false, { kind: "bridge_down", message: "schedule THREW " + expErr(e) }); }
+      return;
+    }
+
+    // ---- CRC ok ----
+    st.frameFails = 0;
+    st.consecutiveFails = 0;
+    if (st.stormRounds > 0) { st.stormRounds = 0; log("BTIPC: STORM exit"); }
+
+    if (!d.valid) {
+      // BUSY 固定帧(§3.2):退避后**同 r 重poll**,不 r++。
+      // BUSY = “本 window 的 DATA 尚未就绪”,不是新 frame;翻译等待期靠这个反复轮询。
+      // 此时桥端尚未 setFrames,不会锚定 frameStartRound,待首个 DATA poll 才锚定。
+      log("BTIPC: r=" + st.r + " seq=-1 len=-1 dt=" + dt + " BUSY");
+      try {
+        $.Schedule(BTIPC_BUSY_BACKOFF_MS / 1000, function () {
+          if (State.btipcActive !== st) return;
+          btipcShot(st);
+        });
+      } catch (e) { btipcFinish(st, false, { kind: "bridge_down", message: "schedule THREW " + expErr(e) }); }
+      return;
+    }
+
+    // 数据帧:按 seq 入账(重复幂等),END 验收 0..max 连续
+    if (!st.parts[d.seq]) st.parts[d.seq] = d.payload;
+    log("BTIPC: r=" + st.r + " seq=" + d.seq + " len=" + d.len + " dt=" + dt + (d.end ? " END" : " OK"));
+    if (!d.end) { st.r += 1; btipcShot(st); return; }
+
+    let maxSeq = -1;
+    for (const k in st.parts) { const n = parseInt(k, 10); if (!isNaN(n) && n > maxSeq) maxSeq = n; }
+    const concat = [];
+    let gap = -1;
+    for (let i = 0; i <= maxSeq; i += 1) {
+      const pl = st.parts[i];
+      if (!pl) { gap = i; break; }
+      for (let j = 0; j < pl.length; j += 1) concat.push(pl[j]);
+    }
+    if (gap >= 0) {
+      // 正常流不可能(帧序到达、CRC fail 不推进);真到 = 状态被打破,诚实拒绝
+      log("BTIPC: r=" + st.r + " GAP missing=" + gap + " → crc_dead");
+      btipcFinish(st, false, { kind: "crc_dead", message: "gap at seq " + gap });
+      return;
+    }
+    const got = btipcUtf8Decode(concat);
+    log("BTIPC: DONE win=" + st.win + " id=" + st.idHex + " frames=" + (maxSeq + 1) +
+        " bytes=" + concat.length + " total=" + (nowMs() - st.tReq) + "ms");
+    // 翻译模式下空串 = 桥端翻译失败(协议零改动:失败编为空 END 帧)。
+    // 回声模式不做此判定 —— "" 是合法回声。传输层已 DONE,这里只把语义错误上报给上层。
+    if (st.translate && got === "") {
+      btipcFinish(st, false, { kind: "translate_error", message: "bridge returned empty translation" });
+      return;
+    }
+    btipcFinish(st, true, got);
+  }
+
+  function btipcFinish(st, ok, value) {
+    if (State.btipcActive !== st) return;
+    State.btipcActive = null;
+    st.roundOpen = false;
+    if (ok) { try { st.resolve(value); } catch (e) { log("btipc: resolve THREW " + expErr(e)); } }
+    else { try { st.reject(value); } catch (e) { log("btipc: reject THREW " + expErr(e)); } }
+  }
+
+  // ---- API(§7 冻结 Promise 形)----
+  const BTIPC = {
+    busy: function () { return !!State.btipcActive; },
+    newWindowId: function () { return ("000000" + (nowMs() & 0xffffff).toString(16)).slice(-6); },
+    cancel: function () {
+      const st = State.btipcActive;
+      if (!st) return;
+      try { log("BTIPC CAN w=" + st.win); } catch (e) {}
+      btipcFinish(st, false, { kind: "cancelled", message: "cancel() called" });
+    },
+    request: function (opts) {
+      opts = opts || {};
+      return new Promise(function (resolve, reject) {
+        try {
+          const text = String(opts.text == null ? "" : opts.text);
+          const bytes = btipcUtf8Bytes(text);
+          const win = String(opts.windowId == null ? "" : opts.windowId);
+          if (!/^[0-9a-f]{6}$/.test(win)) {
+            reject({ kind: "bad_args", message: "windowId 需 6 位小写 hex(BTIPC.newWindowId())" });
+            return;
+          }
+          if (bytes.length > BTIPC_REQ_MAX_PAYLOAD) {
+            reject({ kind: "too_long", message: "payload " + bytes.length + "B > " + BTIPC_REQ_MAX_PAYLOAD + "B" });
+            return;
+          }
+          if (State.btipcActive) {
+            reject({ kind: "busy", message: "已有在途传输 win=" + State.btipcActive.win });
+            return;
+          }
+          const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : BTIPC_REQ_TIMEOUT_MS;
+          // translate=false → REQ(回声 conformance);true → TRQ(⑥ 翻译,空 END 帧 = 失败)
+          const translate = opts.translate === true;
+          const id = Math.floor(Math.random() * 65536);
+          const idHex = ("0000" + id.toString(16)).slice(-4);
+          const crcHex = ("0000" + btipcCrc16(bytes).toString(16)).slice(-4);
+          const b64 = btipcBase64(bytes);
+          const st = {
+            win: win, id: id, idHex: idHex, text: text, timeoutMs: timeoutMs, translate: translate,
+            r: 1, roundNo: 0, fire: {}, roundOpen: false, shotAt: 0,
+            frameFails: 0, consecutiveFails: 0, stormRounds: 0,
+            parts: {}, tReq: nowMs(), resolve: resolve, reject: reject,
+          };
+          State.btipcActive = st;
+          // REQ/TRQ 行(§5):桥端 tail 自 [LCT] 起解析,行头 54 + b64 后 ≤1000(J1)
+          // REQ 与 TRQ 命令词等长,故 translate 不额外占用行预算。
+          log("BTIPC " + (translate ? "TRQ" : "REQ") + " w=" + win + " id=" + idHex +
+              " len=" + bytes.length + " crc=" + crcHex + " b64=" + b64);
+          btipcEnsureHandler();
+          try {
+            $.Schedule(timeoutMs / 1000, function () {
+              if (State.btipcActive !== st) return;
+              log("BTIPC: REQ_TIMEOUT win=" + st.win + " after " + timeoutMs + "ms");
+              btipcFinish(st, false, { kind: "timeout", message: "REQ_TIMEOUT " + timeoutMs + "ms" });
+            });
+            $.Schedule(BTIPC_FIRST_SHOT_DELAY_MS / 1000, function () {
+              if (State.btipcActive !== st) return;
+              btipcShot(st);
+            });
+          } catch (e) {
+            btipcFinish(st, false, { kind: "bridge_down", message: "schedule THREW " + expErr(e) });
+          }
+        } catch (e) {
+          reject({ kind: "bad_args", message: expErr(e) });
+        }
+      });
+    },
+  };
+
+  // /bt6736 [n] [text]: BTIPC 回声 conformance(§12.4)—— 桥回声模式,回显必须与发送逐字节一致
+  function runBtipcEcho(arg) {
+    if (State.bitRunning || State.dRunning || State.eRunning || State.c5) {
+      log("btipc6736: 探针在途,refuse(防两套 ImageLoaded 互相污染)");
+      return;
+    }
+    if (BTIPC.busy()) { log("btipc6736: BTIPC busy,先等当前传输结束"); return; }
+    let count = 1;
+    let text = "Hello BTIPC";
+    const m = /^(\d+)(?:\s+([\s\S]+))?$/.exec(String(arg || "").trim());
+    if (m) {
+      count = Math.max(1, Math.min(100, parseInt(m[1], 10)));
+      if (m[2]) text = m[2];
+    } else if (String(arg || "").trim()) {
+      text = String(arg).trim();
+    }
+    log("btipc6736: START n=" + count + " text=" + JSON.stringify(text));
+    let done = 0;
+    let failed = 0;
+    const runOne = function () {
+      if (done >= count) {
+        log("btipc6736: ALL DONE n=" + count + " ok=" + (count - failed) + " fail=" + failed);
+        return;
+      }
+      done += 1;
+      const win = BTIPC.newWindowId();
+      const t0 = nowMs();
+      BTIPC.request({ windowId: win, text: text }).then(function (got) {
+        const match = got === text;
+        if (!match) failed += 1;
+        log("btipc6736: RUN " + done + "/" + count + " win=" + win +
+            (match ? " ECHO_OK" : " ECHO_MISMATCH") + " dt=" + (nowMs() - t0) +
+            " got=" + JSON.stringify(String(got).slice(0, 60)));
+        try { $.Schedule(0.3, runOne); } catch (e) { log("btipc6736: schedule THREW " + expErr(e)); }
+      }).catch(function (err) {
+        failed += 1;
+        log("btipc6736: RUN " + done + "/" + count + " win=" + win + " FAIL kind=" + (err && err.kind) +
+            " msg=" + (err && err.message) + " dt=" + (nowMs() - t0));
+        try { $.Schedule(1.0, runOne); } catch (e) { log("btipc6736: schedule THREW " + expErr(e)); }
+      });
+    };
+    runOne();
+  }
+
+  // /bt6737 [text]: BTIPC 翻译 smoke(⑥)—— 验证 TRQ→BUSY→译文全链。
+  // 翻译层只见 BTIPC.request() 的 Promise,不见 panel/CRC/round/frameFails。
+  function runBtipcTranslate(arg) {
+    if (State.bitRunning || State.dRunning || State.eRunning || State.c5) {
+      log("btipc6737: 探针在途,refuse(防两套 ImageLoaded 互相污染)");
+      return;
+    }
+    if (BTIPC.busy()) { log("btipc6737: BTIPC busy,先等当前传输结束"); return; }
+    const text = String(arg || "");
+    const win = BTIPC.newWindowId();
+    const t0 = nowMs();
+    log("btipc6737: START text=" + JSON.stringify(text.slice(0, 60)));
+    BTIPC.request({ windowId: win, text: text, translate: true }).then(function (got) {
+      log("btipc6737: OK win=" + win + " dt=" + (nowMs() - t0) + "ms got=" + JSON.stringify(String(got).slice(0, 80)));
+    }).catch(function (err) {
+      log("btipc6737: FAIL win=" + win + " kind=" + (err && err.kind) +
+          " msg=" + (err && err.message) + " dt=" + (nowMs() - t0) + "ms");
+    });
+  }
+
   function handleChatSubmit(input) {
     const now = nowMs();
     if (State.lastSubmitAt && now - State.lastSubmitAt < 150) return;
@@ -3219,6 +3860,10 @@ function injectTranslation(row, sig, text, fragment) {
 
     const raw = safeText(input);
     const trimmed = String(raw).trim();
+
+    // EXP6734-C: C-5 两段 Enter 判定钩子(第1下拦截改写不发送;第2下放行走正常发送)
+    if (State.c5 && exp6734cSubmitHook(input, trimmed)) return;
+
     if (!trimmed) return;
 
     // /tr 命令:打开设置面板,不发送
@@ -3228,8 +3873,53 @@ function injectTranslation(row, sig, text, fragment) {
       return;
     }
 
+    // /bt6734e: 多值符号判别实验(6734-E),不发送
+    if (trimmed === "/bt6734e") {
+      clearInput();
+      runExp6734E();
+      return;
+    }
+
+    // /bt6734d [n|win]: Bridge→Panorama 下行吞吐基准(6734-D),不发送
+    //   无参 = 全矩阵 D1~D6(16/32/64/96/128/256 面板 × 20 轮);数字 = 单配置;win = 窗口组 W1~W5
+    if (trimmed === "/bt6734d" || trimmed.indexOf("/bt6734d ") === 0) {
+      const dArg = trimmed.slice(8).trim();
+      clearInput();
+      runExp6734D(dArg);
+      return;
+    }
+
+    // /bt6734b: 真实对局延迟测试(6734-B),不发送
+    if (trimmed === "/bt6734b") {
+      clearInput();
+      runExp6734B();
+      return;
+    }
+
+    // /bt6734c: 输入框控制实验(6734-C),不发送;布防后两段手动 Enter 判定
+    if (trimmed === "/bt6734c") {
+      runExp6734C(input, trimmed);
+      return;
+    }
+
     // !lcttest 测试命令:向 HUD 顶栏聊天注入一条英文消息(不真实发送)
     // 用途:无队友/无 bot 时验证 HUD 扫描+翻译通路;进训练场即可测
+    // /bt6736 [n] [text]: BTIPC v1 回声 conformance(§12.4),不发送;默认 1×"Hello BTIPC",数字=连发次数
+    if (trimmed === "/bt6736" || trimmed.indexOf("/bt6736 ") === 0) {
+      const echoArg = trimmed.slice(8);
+      clearInput();
+      runBtipcEcho(echoArg);
+      return;
+    }
+
+    // /bt6737 [text]: BTIPC v1 翻译链 smoke(⑥)—— TRQ → BUSY → 译文;不发送
+    if (trimmed === "/bt6737" || trimmed.indexOf("/bt6737 ") === 0) {
+      const trArg = trimmed.slice(8).trim();
+      clearInput();
+      runBtipcTranslate(trArg || "hello can you push mid");
+      return;
+    }
+
     if (trimmed === "!lcttest" || trimmed.indexOf("!lcttest ") === 0) {
       const testText = trimmed.length > 9 ? trimmed.slice(9).trim() : "hello can you push mid";
       injectHudTestMessage(testText);
@@ -3240,7 +3930,7 @@ function injectTranslation(row, sig, text, fragment) {
     // 发送前翻译(off=发原文 / translation=仅译文 / bilingual=原文|译文)
     // 按配置的发送前翻译模式处理
     const outgoingMode = State.cfg.outgoing || "off";
-    if (State.cfg.enabled && outgoingMode !== "off" && trimmed.charAt(0) !== "/") {
+    if (State.cfg.enabled && outgoingMode !== "off" && trimmed.charAt(0) !== "/" && !State.c5) {
       const outTarget = resolveOutgoingTarget();
       // 防重复发送:同一文本翻译中,重复按 Enter 直接忽略(避免队列积压发多条)
       // 不同文本则排队(前一文本的翻译结果已提交,不冲突)
@@ -3986,6 +4676,1869 @@ function injectTranslation(row, sig, text, fragment) {
     trySync();
   }
 
+  // ============= EXP6727: Panorama IPC 检查表探针(检查表: 新建 文本文档.txt A~E/I) =============
+  // 运行时机: boot 后 5s,每会话一次。结果双路上报:
+  //   ① $.Msg -> 游戏 console.log -> 桥 tail(logs/bridge.log 中 [game] 行)
+  //   ② Image SetImage(/probe?d=..) 信标 -> 桥日志 PROBE 行(同时验证出站通道)
+  // 两项都到 = 出站链路双向冗余可用;后续回填 docs/ipc-checklist-6726.md 状态列。
+  function expSendBeacon(data) {
+    try {
+      State.expSeq = (State.expSeq || 0) + 1;
+      const idx = State.expSeq % 3; // 3 个面板轮换,避免连续改 src 互相取消加载
+      const id = "LCTBeacon" + idx;
+      let p = null;
+      try { p = findChild(getRoot(), id); } catch (e0) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), id); } catch (e1) {}
+        if (isValid(p)) { try { p.visible = false; p.style.width = "2px"; p.style.height = "2px"; } catch (e2) {} }
+      }
+      if (!isValid(p) || typeof p.SetImage !== "function") return;
+      const url = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe?seq=" + State.expSeq +
+        "&d=" + encodeURIComponent(String(data || "").slice(0, 3500));
+      p.SetImage(url);
+    } catch (e) {}
+  }
+
+  function expPump() {
+    if (State.expPumping) return;
+    if (!State.expQueue || !State.expQueue.length) return;
+    State.expPumping = true;
+    const msg = State.expQueue.shift();
+    expSendBeacon(msg);
+    // 0.2s 间隔: 信标自身也是一次高频出站小考(连续 10+ 条不丢)
+    try {
+      $.Schedule(0.2, function () { State.expPumping = false; expPump(); });
+    } catch (e) { State.expPumping = false; }
+  }
+
+  function dlog(msg) {
+    log("exp6727: " + msg);
+    try {
+      if (!State.expQueue) State.expQueue = [];
+      if (State.expQueue.length < 400) State.expQueue.push(String(msg));
+      expPump();
+    } catch (e) {}
+  }
+
+  // 长枚举结果分片(每片 ~500 字符,避免单行过长被引擎截断)
+  function expChunk(prefix, s) {
+    const size = 500;
+    for (let i = 0; i < s.length; i += size) {
+      dlog(prefix + "#" + (i / size) + ": " + s.slice(i, i + size));
+    }
+    if (!s.length) dlog(prefix + "#0: <empty>");
+  }
+
+  // 从 GameInterfaceAPI 或全局找函数(返回 {o,f},调用时用 f.apply(o) 保 this 绑定)
+  function expFindFn(name) {
+    try {
+      if (typeof GameInterfaceAPI !== "undefined" && GameInterfaceAPI && typeof GameInterfaceAPI[name] === "function") {
+        return { o: GameInterfaceAPI, f: GameInterfaceAPI[name] };
+      }
+    } catch (e) {}
+    try {
+      if (typeof globalThis[name] === "function") return { o: globalThis, f: globalThis[name] };
+    } catch (e) {}
+    return null;
+  }
+
+  function expErr(e) {
+    return e && e.message ? e.message : String(e);
+  }
+
+  function runExp6727() {
+    if (State.exp6727Done) return;
+    State.exp6727Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("start v" + VERSION + " ts=" + ts);
+
+    // ===== A. Panorama -> Engine 基础接口 =====
+    let gia = null;
+    try { gia = (typeof GameInterfaceAPI !== "undefined") ? GameInterfaceAPI : null; } catch (e) {}
+    dlog("A1 typeof GameInterfaceAPI=" + (typeof GameInterfaceAPI));
+    if (gia) {
+      const keys = [];
+      try {
+        for (const k in gia) { try { keys.push(k + ":" + typeof gia[k]); } catch (e2) {} }
+      } catch (e) {}
+      expChunk("A1 gia keys", keys.join(","));
+    }
+    // A2: ConsoleCommand 执行无害命令(echo,输出进 console.log 供桥 tail 验证)
+    const cmd = expFindFn("ConsoleCommand");
+    if (cmd) {
+      try {
+        const r = cmd.f.apply(cmd.o, ["echo BT_CMD_OK_" + ts]);
+        dlog("A2 ConsoleCommand(echo) returned " + String(r));
+      } catch (e) { dlog("A2 ConsoleCommand threw: " + expErr(e)); }
+    } else {
+      dlog("A2 ConsoleCommand missing");
+    }
+    // A3/A4: 设置写入-回读 roundtrip(A6: 读回值再 echo 出去 = 设置->桥)
+    const setS = expFindFn("SetSettingString");
+    const getS = expFindFn("GetSettingString");
+    dlog("A3/A4 GetSettingString=" + !!getS + " SetSettingString=" + !!setS);
+    if (setS && getS) {
+      const wv = "BT_SET_" + ts;
+      let wr = "n/a";
+      try { wr = String(setS.f.apply(setS.o, ["lct_probe", wv])); } catch (e) { wr = "threw: " + expErr(e); }
+      let rv = "n/a";
+      try { rv = String(getS.f.apply(getS.o, ["lct_probe", ""])); }
+      catch (e1) { try { rv = String(getS.f.apply(getS.o, ["lct_probe"])); } catch (e2) { rv = "threw: " + expErr(e2); } }
+      dlog("A4 set(lct_probe," + wv + ") ret=" + wr);
+      dlog("A3 readback=" + rv + " match=" + (rv === wv));
+      if (cmd) {
+        try { cmd.f.apply(cmd.o, ["echo BT_A6 " + rv]); dlog("A6 echo of readback sent (watch bridge)"); }
+        catch (e) { dlog("A6 echo threw: " + expErr(e)); }
+      }
+    }
+    // A5: 命令行参数查询
+    const hclp = expFindFn("HasCommandLineParm");
+    if (hclp) {
+      try {
+        const b = hclp.f.apply(hclp.o, ["-novid"]);
+        dlog("A5 HasCommandLineParm(-novid)=" + String(b) + " typeof=" + typeof b);
+      } catch (e) { dlog("A5 threw: " + expErr(e)); }
+    } else { dlog("A5 HasCommandLineParm missing"); }
+    const gclp = expFindFn("GetCommandLineParm");
+    dlog("A5 GetCommandLineParm present=" + !!gclp);
+
+    // ===== I0. 全局面枚举(找现成 C++ -> Panorama 入口) =====
+    try {
+      const g = [];
+      try { for (const k in globalThis) { try { g.push(k + ":" + typeof globalThis[k]); } catch (e2) {} } } catch (e) {}
+      expChunk("I0 globals", g.join(","));
+    } catch (e) { dlog("I0 globals failed: " + expErr(e)); }
+
+    // ===== B. Console/Log 通道(桥 tail 自动验收: BT_ 前缀行) =====
+    // B4 长度: 100/500/1000 字符,看 console.log 是否截断
+    function rawMsg(m) { try { $.Msg(m); } catch (e) {} }
+    function rep(ch, n) { return new Array(n + 1).join(ch); }
+    rawMsg("BT_LEN100 " + rep("x", 91));   // 总长 100
+    rawMsg("BT_LEN500 " + rep("x", 491));   // 总长 500
+    rawMsg("BT_LEN1000 " + rep("x", 990));  // 总长 1000
+    dlog("B4 len100/500/1000 sent");
+    // B5 高频: 连发 10 条(不加间隔,测引擎/文件层丢包)
+    for (let i = 1; i <= 10; i += 1) rawMsg("BT_BURST " + i + "/10 ts=" + ts);
+    dlog("B5 burst x10 sent");
+    // B6 特殊字符: 中文/日文/emoji/JSON/引号/竖线 + 原生换行(两行,第二行无标记 -> 验证桥 tail 续行)
+    let uni = "";
+    try {
+      uni = JSON.stringify({ zh: "中文测试", ja: "日本語", emoji: "\ud83d\ude00", quote: "he said \"hi\"", pipe: "a|b|c" });
+    } catch (e) { uni = "{\"err\":\"" + expErr(e) + "\"}"; }
+    rawMsg("BT_UNI " + uni);
+    rawMsg("BT_NL part1 ts=" + ts + "\npart2-continuation ts=" + ts);
+    dlog("B6 unicode/json/newline sent");
+
+    // ===== C. Clipboard =====
+    try {
+      const clipHits = [];
+      const roots = [["gia", gia], ["$", $], ["global", globalThis]];
+      for (const rr of roots) {
+        try {
+          for (const k in rr[1]) {
+            if (String(k).toLowerCase().indexOf("clip") !== -1) clipHits.push(rr[0] + "." + k + ":" + typeof rr[1][k]);
+          }
+        } catch (e) {}
+      }
+      dlog("C1 clip APIs: " + (clipHits.length ? clipHits.join(",") : "NONE"));
+      // 找到写/读口就实际交换一次
+      const clipNames = ["SetClipboardText", "ClipboardCopy", "CopyToClipboard", "ClipboardSet", "GetClipboardText", "ClipboardGet", "ReadClipboard", "PasteFromClipboard"];
+      let clipW = null;
+      let clipR = null;
+      for (const n of clipNames) {
+        const fn = expFindFn(n);
+        if (!fn) continue;
+        if (!clipW && n.toLowerCase().indexOf("set") !== -1) clipW = { fn: fn, name: n };
+        if (!clipR && (n.toLowerCase().indexOf("get") !== -1 || n.toLowerCase().indexOf("read") !== -1)) clipR = { fn: fn, name: n };
+      }
+      if (clipW) {
+        const cv = "BT_CLIP_" + ts;
+        try {
+          const rr2 = clipW.fn.f.apply(clipW.fn.o, [cv]);
+          dlog("C2 " + clipW.name + "(\"" + cv + "\") returned " + String(rr2) + " (check Windows clipboard)");
+        } catch (e) { dlog("C2 " + clipW.name + " threw: " + expErr(e)); }
+      } else { dlog("C2 no write API found (C1 list)"); }
+      if (clipR) {
+        try {
+          const rv2 = clipR.fn.f.apply(clipR.fn.o, []);
+          dlog("C3 " + clipR.name + "() read = " + String(rv2).slice(0, 120));
+        } catch (e) { dlog("C3 " + clipR.name + " threw: " + expErr(e)); }
+      } else { dlog("C3 no read API found (C1 list)"); }
+    } catch (e) { dlog("C section failed: " + expErr(e)); }
+
+    // ===== D. CitadelHTMLPanel =====
+    let hp = null;
+    try { hp = $.CreatePanel("CitadelHTMLPanel", getRoot(), "LCTHtmlProbe"); }
+    catch (e) { dlog("D1 CreatePanel threw: " + expErr(e)); }
+    dlog("D1 CitadelHTMLPanel created=" + !!hp);
+    if (hp) {
+      try {
+        const pn = [];
+        try { for (const k in hp) { try { pn.push(k + ":" + typeof hp[k]); } catch (e2) {} } } catch (e) {}
+        expChunk("D2/D3 props", pn.join(","));
+      } catch (e) { dlog("D2/D3 enumerate failed: " + expErr(e)); }
+      // D5~D8 重点方法点名
+      const watch = ["SetURL", "Navigate", "NavigateToURL", "LoadPage", "Load", "Evaluate", "Execute", "EvalScript", "RunScript", "PostMessage", "SendMessage", "SetReadyForDisplay", "BReadyForDisplay", "SetImage"];
+      const present = [];
+      const absent = [];
+      for (const m of watch) {
+        try { if (typeof hp[m] === "function") present.push(m); else absent.push(m); }
+        catch (e) { absent.push(m); }
+      }
+      dlog("D5-D8 present: " + present.join(","));
+      dlog("D5-D8 missing: " + absent.join(","));
+      // D9/D10 title / location 回读
+      try { dlog("D9 title=" + String(hp.title)); } catch (e) { dlog("D9 title threw: " + expErr(e)); }
+      try { dlog("D10 location=" + String(hp.location)); } catch (e) { dlog("D10 location threw: " + expErr(e)); }
+      // D4: SetURL 是否真的产生请求(桥日志出现 PROBE seq=cit1 即活)
+      if (present.indexOf("SetURL") !== -1) {
+        try {
+          hp.SetURL("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe?seq=cit1&d=D4-seturl-reached");
+          dlog("D4 SetURL sent (watch bridge PROBE seq=cit1)");
+        } catch (e) { dlog("D4 SetURL threw: " + expErr(e)); }
+      }
+      // D12: 若有执行 JS 能力,试无害脚本(回读 title 验证)
+      const execName = present.indexOf("Evaluate") !== -1 ? "Evaluate" : (present.indexOf("Execute") !== -1 ? "Execute" : null);
+      if (execName) {
+        try {
+          const er = hp[execName]("document.title='BT_PAGE_'+'JS'");
+          dlog("D12 " + execName + "(js) returned " + String(er));
+        } catch (e) { dlog("D12 " + execName + " threw: " + expErr(e)); }
+      }
+      // D11: 页面 -> Panorama 回调面
+      const evReg = ["RegisterForReadyEvents", "RegisterForUnhandledEvent", "SetPageEvent", "AddEventListener"];
+      for (const en of evReg) {
+        try { if (typeof hp[en] === "function") dlog("D11 has " + en); } catch (e) {}
+      }
+    }
+
+    // ===== E. Panorama 事件总线 =====
+    try {
+      if (typeof $.RegisterForUnhandledEvent === "function") {
+        const h = $.RegisterForUnhandledEvent("LCT_DIAG_EVT", function () {
+          dlog("E1 custom event FIRED");
+        });
+        dlog("E1 RegisterForUnhandledEvent ok, handle=" + String(h));
+        const disp = [];
+        try {
+          for (const k in $) {
+            const kl = String(k).toLowerCase();
+            if (kl.indexOf("dispatch") !== -1 || kl.indexOf("fire") !== -1 || kl.indexOf("trigger") !== -1) disp.push(k);
+          }
+        } catch (e) {}
+        dlog("E1 dispatch-ish $ fns: " + (disp.length ? disp.join(",") : "NONE"));
+        if (disp.length) {
+          try { $[disp[0]]("LCT_DIAG_EVT"); dlog("E1 fired via " + disp[0] + " (if no FIRED line, bus is receive-only from C++)"); }
+          catch (e) { dlog("E1 fire via " + disp[0] + " threw: " + expErr(e)); }
+        }
+      } else { dlog("E1 $.RegisterForUnhandledEvent missing"); }
+    } catch (e) { dlog("E1 failed: " + expErr(e)); }
+
+    dlog("done (check bridge logs/bridge.log for PROBE/[game] lines)");
+  }
+
+  // ============= EXP6728: 入站三连探针(唯一目标 J2: Bridge → Panorama) =============
+  // ① CitadelHTMLPanel.RunScriptInPanelContext — 能否执行 JS/有无返回值/完整异常
+  // ② Object.getOwnPropertyNames 扫非枚举盲区: globalThis / panorama / $ / GameEvents
+  // ③ RegisterForUnhandledEvent 白名单批量探测: VALID/INVALID/THROWS_OTHER + 触发观察
+  // 本轮不碰: AsyncWebRequest / SetURL / title / 布局尺寸 / ConsoleCommand(已判死,收益低)
+  // 上报同 6727: $.Msg(console.log 尾随) + /probe 信标双路。
+  function runExp6728() {
+    if (State.exp6728Done) return;
+    State.exp6728Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6728 start v" + VERSION + " ts=" + ts);
+
+    // ---- ① RunScriptInPanelContext(第一优先级) ----
+    try {
+      let hp8 = null;
+      try { hp8 = $.CreatePanel("CitadelHTMLPanel", getRoot(), "LCTHtmlProbe8"); }
+      catch (e0) { dlog("28-① create threw: " + expErr(e0)); }
+      dlog("28-① CitadelHTMLPanel created=" + !!hp8);
+      if (hp8) {
+        try {
+          dlog("28-① paneltype=" + String(hp8.paneltype) + " type=" + String(hp8.type) + " layoutfile=" + String(hp8.layoutfile));
+        } catch (e) {}
+        let rs = null;
+        try { rs = hp8.RunScriptInPanelContext; } catch (e) { dlog("28-① RSI access threw: " + expErr(e)); }
+        dlog("28-① RunScriptInPanelContext typeof=" + typeof rs + " arity=" + (typeof rs === "function" ? rs.length : "-"));
+        if (typeof rs === "function") {
+          const tries = [
+            ["return123", "return 123"],
+            ["expr", "1+1"],
+            ["console", "console.log('BT_RSTEST_123 ts=" + ts + "')"],
+            ["title", "document.title = 'RSTEST_TITLE'"],
+          ];
+          for (const tt of tries) {
+            try {
+              const r = hp8.RunScriptInPanelContext(tt[1]);
+              dlog("28-① RSI[" + tt[0] + "] returned typeof=" + typeof r + " val=" + String(r).slice(0, 120));
+            } catch (e) { dlog("28-① RSI[" + tt[0] + "] THREW: " + expErr(e)); }
+          }
+          // 变体: 双参(脚本, 回调)
+          try {
+            const r2 = hp8.RunScriptInPanelContext("1+1", function (v) { dlog("28-① RSI cb: " + String(v)); });
+            dlog("28-① RSI(2-arg) returned " + String(r2));
+          } catch (e) { dlog("28-① RSI(2-arg) THREW: " + expErr(e)); }
+        }
+        // 同轮漏网的 Data() 方法顺带点名
+        try {
+          const df = hp8.Data;
+          dlog("28-① Data typeof=" + typeof df + " arity=" + (typeof df === "function" ? df.length : "-"));
+          if (typeof df === "function") {
+            try { dlog("28-① Data() => " + String(hp8.Data()).slice(0, 120)); }
+            catch (e2) { dlog("28-① Data() THREW: " + expErr(e2)); }
+          }
+        } catch (e) { dlog("28-① Data access THREW: " + expErr(e)); }
+      }
+    } catch (e) { dlog("28-① section failed: " + expErr(e)); }
+
+    // ---- ② 隐藏全局 API 扫描(for..in 只见可枚举,这里用 getOwnPropertyNames) ----
+    const KW28 = ["game", "settin", "command", "clip", "file", "http", "web", "request", "event", "panel", "engine", "console", "nettable", "steam", "route", "exec", "script", "message"];
+    function expEnum28(label, obj) {
+      if (obj == null) { dlog("28-② " + label + " = null/undefined"); return null; }
+      let names = null;
+      try { names = Object.getOwnPropertyNames(obj); }
+      catch (e) { dlog("28-② " + label + " getOwnPropertyNames THREW: " + expErr(e)); return null; }
+      expChunk("28-② " + label + " props", names.join(","));
+      const hits = [];
+      for (const n of names) {
+        const nl = String(n).toLowerCase();
+        for (const k of KW28) { if (nl.indexOf(k) !== -1) { hits.push(n); break; } }
+      }
+      dlog("28-② " + label + " keyword hits: " + (hits.length ? hits.join(",") : "NONE"));
+      return hits;
+    }
+    try {
+      dlog("28-② typeof GameInterfaceAPI=" + (typeof GameInterfaceAPI) +
+        " GameEvents=" + (typeof GameEvents) +
+        " CustomNetTables=" + (typeof CustomNetTables) +
+        " panorama=" + (typeof panorama));
+      let gn = [];
+      try { gn = Object.getOwnPropertyNames(globalThis); }
+      catch (e) { dlog("28-② globalThis THREW: " + expErr(e)); }
+      expChunk("28-② globalThis props", gn.join(","));
+      const ghits = [];
+      for (const n of gn) {
+        const nl = String(n).toLowerCase();
+        for (const k of KW28) { if (nl.indexOf(k) !== -1) { ghits.push(n); break; } }
+      }
+      dlog("28-② globalThis keyword hits: " + (ghits.length ? ghits.join(",") : "NONE"));
+      expEnum28("panorama", typeof panorama !== "undefined" ? panorama : null);
+      expEnum28("$", $);
+      try { if (typeof GameEvents !== "undefined") expEnum28("GameEvents", GameEvents); } catch (e) {}
+      try { if (typeof CustomNetTables !== "undefined") expEnum28("CustomNetTables", CustomNetTables); } catch (e) {}
+      // 关键字命中的全局再深挖一层(对象/函数型,最多 6 个防刷屏)
+      let deepN = 0;
+      for (const n of ghits) {
+        if (deepN >= 6) break;
+        try {
+          const v = globalThis[n];
+          if (v && (typeof v === "object" || typeof v === "function")) { expEnum28("deep:" + n, v); deepN += 1; }
+        } catch (e) {}
+      }
+    } catch (e) { dlog("28-② section failed: " + expErr(e)); }
+
+    // ---- ③ 事件白名单批量探测 ----
+    try {
+      if (typeof $.RegisterForUnhandledEvent !== "function") {
+        dlog("28-③ RegisterForUnhandledEvent missing");
+      } else {
+        State.exp28Fired = State.exp28Fired || {};
+        const cands = [
+          // 对照组(生产代码已验证可注册)
+          "HTMLContentLoaded", "HTMLChangedTitle", "ClientUI_FireOutput",
+          // 聊天族
+          "ChatMessage", "ChatMsg", "Chat", "PlayerChat", "PlayerChatMessage", "OnChatMessage", "CitadelChatMessage", "HUDChatMessage", "OnPlayerChat", "PlayerSay",
+          // 对局状态族
+          "GameEvent", "PanelLoaded", "LevelInit", "MatchStart", "MatchEnd", "MatchStateChanged", "OnMatchStateChanged", "GameStateChanged", "OnGameStateChange",
+          // 玩家族
+          "PlayerConnect", "PlayerDisconnect", "PlayerInfoChanged", "OnPlayerInfoChanged", "OnPlayerSpawn", "OnPlayerDeath",
+          // HTML 面板族(对照+扩展)
+          "HTMLLoadPage", "HTMLStartRequest", "HTMLFinishRequest", "HTMLURLChanged", "HTMLTitle",
+          // 加载族(图片加载若触发事件 = 入站突破口)
+          "OnImageLoaded", "ImageLoaded", "ImageLoadComplete", "OnTextureLoaded", "ContentLoaded", "OnPanelLoaded", "OnPanelLoad",
+          // 自定义/网络/UI/Steam
+          "CustomGameEvent", "OnCustomGameEvent", "FireGameEvent", "OnFireGameEvent", "NetTableChanged", "CustomNetTableChanged", "OnCustomNetTableChanged",
+          "ClientUIEvent", "UIEvent", "OnUIEvent", "ResolutionChanged", "OnResolutionChanged", "SteamOverlayChanged", "OnSteamOverlayToggled",
+          "EntityKilled", "OnEntityKilled", "OnAbilityCast", "ServerInfo", "OnTimeChanged", "OnLocalPlayerReady"
+        ];
+        const valid = [];
+        const invalid = [];
+        const other = [];
+        const seen = {};
+        for (const name of cands) {
+          if (seen[name]) continue;
+          seen[name] = true;
+          try {
+            $.RegisterForUnhandledEvent(name, (function (nm) {
+              return function () {
+                const cnt = (State.exp28Fired[nm] || 0) + 1;
+                State.exp28Fired[nm] = cnt;
+                if (cnt <= 3) {
+                  let args = "";
+                  try {
+                    const arr = [];
+                    for (let i = 0; i < arguments.length && i < 6; i += 1) {
+                      try { arr.push(String(arguments[i]).slice(0, 160)); }
+                      catch (e2) { arr.push("<" + typeof arguments[i] + ">"); }
+                    }
+                    args = arr.join(" | ");
+                  } catch (e2) {}
+                  dlog("28-③ EVENT FIRED: " + nm + " args(" + arguments.length + ")=" + args.slice(0, 400));
+                }
+              };
+            })(name));
+            valid.push(name);
+          } catch (e) {
+            const m = expErr(e);
+            if (m.indexOf("not a valid event type") !== -1) invalid.push(name);
+            else other.push(name + "{" + m + "}");
+          }
+        }
+        expChunk("28-③ VALID", valid.join(","));
+        dlog("28-③ INVALID count=" + invalid.length + " of " + cands.length);
+        expChunk("28-③ THROWS_OTHER", other.join(",") || "NONE");
+        // $ 里的派发口(能否自己触发事件做回环验证)
+        try {
+          const dk = [];
+          for (const k of Object.getOwnPropertyNames($)) {
+            const kl = String(k).toLowerCase();
+            if (kl.indexOf("dispatch") !== -1 || kl.indexOf("fire") !== -1 || kl.indexOf("trigger") !== -1 || kl.indexOf("emit") !== -1) dk.push(k);
+          }
+          dlog("28-③ $ dispatch-ish: " + (dk.length ? dk.join(",") : "NONE"));
+        } catch (e) { dlog("28-③ dispatch scan THREW: " + expErr(e)); }
+        // 触发观察: 发一条桥信标(加载桥可控资源), 3s 后汇报哪些事件真的到达
+        expSendBeacon("28-E7-trigger ts=" + ts);
+        try {
+          $.Schedule(3.0, function () {
+            const fired = [];
+            for (const k in State.exp28Fired) fired.push(k + "x" + State.exp28Fired[k]);
+            dlog("28-③ fired after image trigger: " + (fired.length ? fired.join(",") : "NONE"));
+            dlog("28-③ done");
+          });
+        } catch (e) { dlog("28-③ schedule failed: " + expErr(e)); }
+      }
+    } catch (e) { dlog("28-③ section failed: " + expErr(e)); }
+  }
+
+  // ============= EXP6729: 入站四连探针(J2 攻坚) =============
+  // ① 事件 args 深挖(HTML*/ImageLoaded 全字段 dump) + 图片 200/404/500/204 状态码差分
+  // ② SetURL 变体矩阵(检测器 = HTML* 事件 + 桥 PROBE, 不再只看桥日志)
+  // ③ Data() dump / RegisterEventHandler 白名单 / BImageFileExists 文件 oracle
+  // ④ RSI 域名探测(我方 context 的 location/document, 为域名对齐铺路)
+  function expDumpVal(v) {
+    const t = typeof v;
+    if (v === null) return "null";
+    if (t === "string") return JSON.stringify(String(v).slice(0, 200));
+    if (t === "number" || t === "boolean") return String(v);
+    if (t === "undefined") return "undefined";
+    if (t === "function") return "fn<" + (v.name || "?") + ">";
+    try {
+      const names = Object.getOwnPropertyNames(v);
+      const parts = [];
+      for (let i = 0; i < names.length && parts.length < 12; i += 1) {
+        let val;
+        try { val = v[names[i]]; } catch (e) { parts.push(names[i] + "=<throw>"); continue; }
+        const vt = typeof val;
+        if (vt === "string") parts.push(names[i] + "=" + JSON.stringify(String(val).slice(0, 140)));
+        else if (vt === "number" || vt === "boolean") parts.push(names[i] + "=" + String(val));
+        else if (val === null) parts.push(names[i] + "=null");
+        else parts.push(names[i] + "<" + vt + ">");
+      }
+      const more = names.length > 12 ? ",+" + (names.length - 12) : "";
+      return "{" + parts.join(",") + more + "}";
+    } catch (e) { return "<dump failed: " + expErr(e) + ">"; }
+  }
+
+  function expEventHandler29(nm) {
+    return function () {
+      if (!State.exp29Fired) State.exp29Fired = {};
+      const cnt = (State.exp29Fired[nm] = (State.exp29Fired[nm] || 0) + 1);
+      if (cnt <= 4) {
+        const parts = [];
+        for (let i = 0; i < arguments.length && i < 5; i += 1) {
+          parts.push("a" + i + "=" + expDumpVal(arguments[i]));
+        }
+        dlog("29-EV " + nm + "#" + cnt + " (" + arguments.length + "a): " + parts.join(" | ").slice(0, 600));
+      }
+    };
+  }
+
+  function runExp6729() {
+    if (State.exp6729Done) return;
+    State.exp6729Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6729 start v" + VERSION + " ts=" + ts);
+
+    // ---- ④ RSI 域名探测: 我方 context 到底是什么 ----
+    try {
+      dlog("29-④ typeof location=" + (typeof location) + " document=" + (typeof document) + " window=" + (typeof window));
+      try { if (typeof location !== "undefined") dlog("29-④ location = " + String(location).slice(0, 300)); } catch (e) { dlog("29-④ location THREW: " + expErr(e)); }
+      try { if (typeof document !== "undefined") dlog("29-④ document.URL=" + String(document.URL) + " title=" + String(document.title)); } catch (e) { dlog("29-④ document THREW: " + expErr(e)); }
+    } catch (e) { dlog("29-④ section failed: " + expErr(e)); }
+
+    // ---- ① 挂8个 VALID 事件的 dump handler(args 全字段) ----
+    try {
+      const dumpEvents = ["ImageLoaded", "PanelLoaded", "HTMLLoadPage", "HTMLStartRequest", "HTMLFinishRequest", "HTMLURLChanged", "HTMLTitle", "ClientUI_FireOutput"];
+      let okN = 0;
+      for (const nm of dumpEvents) {
+        try { $.RegisterForUnhandledEvent(nm, expEventHandler29(nm)); okN += 1; }
+        catch (e) { dlog("29-① register " + nm + " THREW: " + expErr(e)); }
+      }
+      dlog("29-① dump handlers registered: " + okN + "/" + dumpEvents.length);
+    } catch (e) { dlog("29-① register section failed: " + expErr(e)); }
+
+    // ---- ①' 图片状态码差分: 6 个触发(200/404/200/404/500/204),对照 EV 触发序列 ----
+    try {
+      let diffPanel = null;
+      try { diffPanel = findChild(getRoot(), "LCTDiffProbe"); } catch (e0) {}
+      if (!isValid(diffPanel)) {
+        try { diffPanel = $.CreatePanel("Image", getRoot(), "LCTDiffProbe"); } catch (e1) {}
+        if (isValid(diffPanel)) { try { diffPanel.visible = false; diffPanel.style.width = "2px"; diffPanel.style.height = "2px"; } catch (e2) {} }
+      }
+      if (isValid(diffPanel) && typeof diffPanel.SetImage === "function") {
+        const codes = [200, 404, 200, 404, 500, 204];
+        for (let i = 0; i < codes.length; i += 1) {
+          const myI = i;
+          const code = codes[i];
+          try {
+            $.Schedule(myI * 0.8, function () {
+              dlog("29-① TRIGGER n=" + (myI + 1) + " code=" + code);
+              try { diffPanel.SetImage("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_img?code=" + code + "&n=" + (myI + 1)); }
+              catch (e) { dlog("29-① SetImage THREW: " + expErr(e)); }
+            });
+          } catch (e) { dlog("29-① schedule THREW: " + expErr(e)); }
+        }
+        dlog("29-① diff sent 6 triggers (200,404,200,404,500,204), 0.8s apart; compare TRIGGER vs EV ImageLoaded sequence");
+      } else {
+        dlog("29-① diff panel unavailable");
+      }
+    } catch (e) { dlog("29-① diff section failed: " + expErr(e)); }
+
+    // ---- ② SetURL 变体矩阵(检测器 = HTML* 事件 + 桥 PROBE) ----
+    try {
+      let hp9 = null;
+      try { hp9 = findChild(getRoot(), "LCTHtmlProbe"); } catch (e0) {}
+      if (!isValid(hp9)) {
+        try { hp9 = $.CreatePanel("CitadelHTMLPanel", getRoot(), "LCTHtmlProbe"); } catch (e1) {}
+      }
+      if (isValid(hp9) && typeof hp9.SetURL === "function") {
+        const navs = [
+          ["blank", "about:blank"],
+          ["file-abs", "file:///C:/Windows/win.ini"],
+          ["http-local", "http://localhost:8791/probe?seq=nav1&d=seturl-local"],
+          ["http-127", "http://127.0.0.1:8791/probe?seq=nav2&d=seturl-127"]
+        ];
+        for (let i = 0; i < navs.length; i += 1) {
+          const myI = i;
+          const nav = navs[i];
+          try {
+            $.Schedule(1.5 + myI * 1.0, function () {
+              dlog("29-② NAV[" + nav[0] + "] -> " + nav[1]);
+              try { hp9.SetURL(nav[1]); } catch (e) { dlog("29-② SetURL THREW: " + expErr(e)); }
+            });
+          } catch (e) { dlog("29-② schedule THREW: " + expErr(e)); }
+        }
+        dlog("29-② nav matrix queued (blank/file-abs/http-local/http-127); watch 29-EV HTML* args + PROBE seq=nav1/nav2");
+      } else {
+        dlog("29-② panel/SetURL unavailable");
+      }
+    } catch (e) { dlog("29-② section failed: " + expErr(e)); }
+
+    // ---- ③ Data() dump / RegisterEventHandler / BImageFileExists ----
+    try {
+      let hpD = null;
+      try { hpD = findChild(getRoot(), "LCTHtmlProbe"); } catch (e0) {}
+      if (!isValid(hpD)) { try { hpD = $.CreatePanel("CitadelHTMLPanel", getRoot(), "LCTHtmlProbe"); } catch (e1) {} }
+      if (isValid(hpD)) {
+        try {
+          const dv = hpD.Data();
+          dlog("29-③ Data() = " + expDumpVal(dv));
+        } catch (e) { dlog("29-③ Data() THREW: " + expErr(e)); }
+      }
+      // RegisterEventHandler: 另一套注册口(与 unhandled 不同),测 arity + 白名单
+      try {
+        const reh = $.RegisterEventHandler;
+        dlog("29-③ RegisterEventHandler typeof=" + typeof reh + " arity=" + (typeof reh === "function" ? reh.length : "-"));
+        if (typeof reh === "function") {
+          const rehCands = ["ImageLoaded", "HTMLTitle", "ClientUI_FireOutput", "PanelLoaded", "ChatMessage", "LCT_DIAG_EVT"];
+          const rehValid = [];
+          const rehInvalid = [];
+          for (const nm of rehCands) {
+            try { reh(nm, expEventHandler29("REH:" + nm)); rehValid.push(nm); }
+            catch (e) {
+              const m = expErr(e);
+              if (m.indexOf("not a valid event type") !== -1) rehInvalid.push(nm);
+              else rehInvalid.push(nm + "{" + m.slice(0, 80) + "}");
+            }
+          }
+          dlog("29-③ RegisterEventHandler VALID: " + (rehValid.join(",") || "NONE"));
+          dlog("29-③ RegisterEventHandler INVALID: " + (rehInvalid.join(",") || "NONE"));
+        }
+      } catch (e) { dlog("29-③ RegisterEventHandler section THREW: " + expErr(e)); }
+      // BImageFileExists: 文件存在性 oracle(桥可写文件 = 位元入站候选)
+      try {
+        const bf = $.BImageFileExists;
+        dlog("29-③ BImageFileExists typeof=" + typeof bf + " arity=" + (typeof bf === "function" ? bf.length : "-"));
+        if (typeof bf === "function") {
+          const paths = [
+            ["abs-exists", "C:/Windows/win.ini"],
+            ["abs-missing", "C:/no_such_bt_file_zz.ini"],
+            ["file-abs", "file:///C:/Windows/win.ini"],
+            ["game-cfg", "cfg/video.txt"],
+            ["game-console-log", "console.log"],
+            ["resources", "file://{resources}/panorama/styles/lingua_chat.vcss_c"],
+            ["bridge-abs", "F:/BabelTower/logs/bridge.log"]
+          ];
+          for (const pp of paths) {
+            try { dlog("29-③ BIFE[" + pp[0] + "] = " + String(bf(pp[1]))); }
+            catch (e) { dlog("29-③ BIFE[" + pp[0] + "] THREW: " + expErr(e)); }
+          }
+        }
+      } catch (e) { dlog("29-③ BIFE section THREW: " + expErr(e)); }
+    } catch (e) { dlog("29-③ section failed: " + expErr(e)); }
+
+    // 汇总: 8s 后报事件触发统计(差分结论靠它)
+    try {
+      $.Schedule(8.0, function () {
+        const fired = [];
+        if (State.exp29Fired) { for (const k in State.exp29Fired) fired.push(k + "x" + State.exp29Fired[k]); }
+        dlog("29-SUM fired: " + (fired.length ? fired.join(",") : "NONE"));
+        dlog("29-SUM done");
+      });
+    } catch (e) { dlog("29-SUM schedule failed: " + expErr(e)); }
+  }
+
+  // ============= EXP6730: 严格三测(不扩散) =============
+  // ① ImageLoaded 精确差分(身份过滤): 200/204/404/500/connection-refused -> 是否触发 + a1 内容
+  // ② RegisterEventHandler arity 猜签名: 1~5 参逐个试,只找参数个数,不猜事件名
+  // ③ BImageFileExists 资源对照: 真实 s2r 路径 3 形式 + 材质路径 + 不存在路径
+  // 本轮不测: SetURL/file://localhost/AsyncWebRequest/RSI/Data()/GameInterfaceAPI(已判死或已定案)
+  function runExp6730() {
+    if (State.exp6730Done) return;
+    State.exp6730Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6730 start v" + VERSION + " ts=" + ts);
+
+    // ---- ① ImageLoaded 精确差分 ----
+    try {
+      let dp = null;
+      try { dp = findChild(getRoot(), "LCTDiffProbe"); } catch (e0) {}
+      if (!isValid(dp)) {
+        try { dp = $.CreatePanel("Image", getRoot(), "LCTDiffProbe"); } catch (e1) {}
+        if (isValid(dp)) { try { dp.visible = false; dp.style.width = "2px"; dp.style.height = "2px"; } catch (e2) {} }
+      }
+      if (!isValid(dp) || typeof dp.SetImage !== "function") {
+        dlog("30-① diff panel unavailable");
+      } else {
+        State.diffPanelId = "LCTDiffProbe";
+        State.diffFired = {};
+        State.diffA1 = {};
+        State.curTrigger = 0;
+        State.curCode = "-";
+        // 身份过滤: 按 id 匹配(跨 wrapper 稳定),只记录我们自己的面板
+        try {
+          $.RegisterForUnhandledEvent("ImageLoaded", function (panel, a1) {
+            let pid = "";
+            try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+            if (pid !== State.diffPanelId) return;
+            const t = State.curTrigger || 0;
+            State.diffFired[t] = (State.diffFired[t] || 0) + 1;
+            if (!State.diffA1[t]) {
+              try { State.diffA1[t] = expDumpVal(a1); } catch (e) { State.diffA1[t] = "<dump fail>"; }
+            }
+            dlog("30-① MY_IMAGE_LOADED #" + t + " code=" + State.curCode + " a1=" + State.diffA1[t]);
+          });
+          dlog("30-① ImageLoaded handler registered (id filter: " + State.diffPanelId + ")");
+        } catch (e) { dlog("30-① handler register THREW: " + expErr(e)); }
+        // 5 个步骤: 200 / 204 / 404 / 500 / refused(死端口 8799)
+        const steps = ["200", "204", "404", "500", "refused"];
+        for (let i = 0; i < steps.length; i += 1) {
+          const myI = i + 1;
+          const code = steps[i];
+          try {
+            $.Schedule(1.5 + i * 1.5, function () {
+              State.curTrigger = myI;
+              State.curCode = code;
+              dlog("30-① TRIGGER #" + myI + " code=" + code);
+              const url = code === "refused"
+                ? "http://localhost:8799/refused.png?n=R" + myI
+                : "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_img?code=" + code + "&n=" + myI;
+              try { dp.SetImage(url); } catch (e) { dlog("30-① SetImage THREW: " + expErr(e)); }
+            });
+          } catch (e) { dlog("30-① schedule THREW: " + expErr(e)); }
+          // 每步触发 1.3s 后判定(本地请求毫秒级,1.3s 窗口足够)
+          try {
+            $.Schedule(1.5 + i * 1.5 + 1.3, function () {
+              const cnt = State.diffFired[myI] || 0;
+              const a1v = State.diffA1[myI] || "-";
+              dlog("30-① RESULT[" + code + "] = " + (cnt ? "FIRED x" + cnt : "NO-EVENT") + " a1=" + a1v);
+            });
+          } catch (e) {}
+        }
+        dlog("30-① steps queued: 200/204/404/500/refused, 1.5s apart (refused = localhost:8799 dead port)");
+      }
+    } catch (e) { dlog("30-① section failed: " + expErr(e)); }
+
+    // ---- ② RegisterEventHandler arity(只找参数个数,不猜事件名) ----
+    try {
+      const reh = $.RegisterEventHandler;
+      dlog("30-② RegisterEventHandler typeof=" + typeof reh);
+      if (typeof reh === "function") {
+        const mk = function (n) {
+          const a = ["ImageLoaded"];
+          if (n >= 2) a.push(function () {});
+          if (n >= 3) a.push({});
+          if (n >= 4) a.push(null);
+          if (n >= 5) a.push(null);
+          return a;
+        };
+        for (let n = 1; n <= 5; n += 1) {
+          try {
+            const r = reh.apply($, mk(n));
+            dlog("30-② REH n=" + n + " => NO THROW, return=" + String(r) + "  <== CANDIDATE");
+          } catch (e) {
+            const m = expErr(e);
+            const wrongN = m.indexOf("Wrong number") !== -1;
+            dlog("30-② REH n=" + n + " => " + (wrongN ? "WrongNumber" : "OTHER: " + m) + "");
+          }
+        }
+        dlog("30-② done (look for n where error stops being WrongNumber)");
+      }
+    } catch (e) { dlog("30-② section failed: " + expErr(e)); }
+
+    // ---- ③ BImageFileExists 资源对照(最后测,全 false 即封案) ----
+    try {
+      const bf = $.BImageFileExists;
+      if (typeof bf === "function") {
+        const cases = [
+          ["known-s2r", "s2r://panorama/images/buttons/button_border_fill_psd.vtex"],
+          ["known-raw", "panorama/images/buttons/button_border_fill_psd.vtex"],
+          ["known-raw-c", "panorama/images/buttons/button_border_fill_psd.vtex_c"],
+          ["known-mat-c", "materials/particle/abilities/archer/mc_sparks.vtex_c"],
+          ["missing", "panorama/images/buttons/definitely_missing_bt_zz.vtex"],
+          ["missing-c", "panorama/images/buttons/definitely_missing_bt_zz.vtex_c"]
+        ];
+        for (const cc of cases) {
+          try { dlog("30-③ BIFE[" + cc[0] + "] = " + String(bf(cc[1]))); }
+          catch (e) { dlog("30-③ BIFE[" + cc[0] + "] THREW: " + expErr(e)); }
+        }
+        dlog("30-③ done (known-* true + missing false => resource-query API; all false => abandoned)");
+      } else {
+        dlog("30-③ BImageFileExists missing");
+      }
+    } catch (e) { dlog("30-③ section failed: " + expErr(e)); }
+
+    // 总汇总(差分5步在 1.5+4*1.5+1.3=8.8s 收尾)
+    try {
+      $.Schedule(10.5, function () {
+        const parts = [];
+        if (State.diffFired) {
+          const labels = ["200", "204", "404", "500", "refused"];
+          for (let i = 1; i <= labels.length; i += 1) {
+            parts.push(labels[i - 1] + ":" + (State.diffFired[i] ? "FIRED" : "NO"));
+          }
+        }
+        dlog("30-SUM diff = " + (parts.length ? parts.join(" | ") : "n/a"));
+        dlog("30-SUM done");
+      });
+    } catch (e) { dlog("30-SUM schedule failed: " + expErr(e)); }
+  }
+
+  // ============= EXP6731: 双实验(判假阴性 + 验3参签名) =============
+  // ① ImageLoaded: 可见2px vs 隐藏双面板, 200/404, 不过滤打印真实 panel.id
+  //    回答: ImageLoaded 能否观察到我们自己创建的 Image?(可见性/身份两嫌并查)
+  // ② RegisterEventHandler 3参实调: ("ImageLoaded", panelObj, fn) 与 ("ImageLoaded", "id", fn)
+  function runExp6731() {
+    if (State.exp6731Done) return;
+    State.exp6731Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6731 start v" + VERSION + " ts=" + ts);
+
+    // ---- 双面板: 可见 2px + 隐藏 ----
+    let vis = null;
+    let hid = null;
+    try { vis = findChild(getRoot(), "LCTDiffVis"); } catch (e0) {}
+    if (!isValid(vis)) {
+      try { vis = $.CreatePanel("Image", getRoot(), "LCTDiffVis"); } catch (e) {}
+      if (isValid(vis)) {
+        try { vis.visible = true; vis.style.width = "2px"; vis.style.height = "2px"; vis.style.x = "0px"; vis.style.y = "0px"; } catch (e) {}
+      }
+    }
+    try { hid = findChild(getRoot(), "LCTDiffHid"); } catch (e0) {}
+    if (!isValid(hid)) {
+      try { hid = $.CreatePanel("Image", getRoot(), "LCTDiffHid"); } catch (e) {}
+      if (isValid(hid)) { try { hid.visible = false; hid.style.width = "2px"; hid.style.height = "2px"; } catch (e) {} }
+    }
+    dlog("31-① panels: vis=" + !!vis + " hid=" + !!hid);
+
+    // ---- ② RegisterEventHandler 3参实调(先注册, 事件来了能双保险捕获) ----
+    try {
+      const reh = $.RegisterEventHandler;
+      if (typeof reh !== "function") {
+        dlog("31-② RegisterEventHandler missing");
+      } else {
+        const rehFn = function (tag) {
+          return function () {
+            const parts = [];
+            for (let i = 0; i < arguments.length && i < 5; i += 1) parts.push("a" + i + "=" + expDumpVal(arguments[i]));
+            dlog("31-② REH EVENT[" + tag + "] (" + arguments.length + "a): " + parts.join(" | ").slice(0, 500));
+          };
+        };
+        // 形态1: (eventName, panelObj, fn)
+        if (isValid(vis)) {
+          try {
+            const r1 = reh("ImageLoaded", vis, rehFn("panelObj"));
+            dlog("31-② REH(panelObj) => OK, return=" + String(r1));
+          } catch (e) { dlog("31-② REH(panelObj) THREW: " + expErr(e)); }
+        }
+        // 形态2: (eventName, panelIdString, fn)
+        try {
+          const r2 = reh("ImageLoaded", "LCTDiffVis", rehFn("idStr"));
+          dlog("31-② REH(idStr) => OK, return=" + String(r2));
+        } catch (e) { dlog("31-② REH(idStr) THREW: " + expErr(e)); }
+        dlog("31-② done (which form did NOT throw?)");
+      }
+    } catch (e) { dlog("31-② section failed: " + expErr(e)); }
+
+    // ---- ① ImageLoaded 全量观察(不过滤) + 我方面板计数 ----
+    try {
+      State.diff31 = {};
+      State.cur31 = "-";
+      State.img31Total = 0;
+      State.img31Logged = 0;
+      $.RegisterForUnhandledEvent("ImageLoaded", function (panel, a1) {
+        State.img31Total += 1;
+        let pid = "";
+        try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+        if (pid === "LCTDiffVis" || pid === "LCTDiffHid") {
+          State.diff31[State.cur31] = (State.diff31[State.cur31] || 0) + 1;
+          dlog("31-① OURS id=" + pid + " label=" + State.cur31 + " a1=" + expDumpVal(a1));
+        } else if (State.img31Logged < 8) {
+          State.img31Logged += 1;
+          dlog("31-① other#" + State.img31Logged + " id=\"" + pid + "\" total=" + State.img31Total);
+        }
+      });
+      dlog("31-① unfiltered ImageLoaded handler registered");
+    } catch (e) { dlog("31-① handler THREW: " + expErr(e)); }
+
+    // ---- 差分: 4 步 (vis-200, vis-404, hid-200, hid-404) ----
+    if (isValid(vis) && isValid(hid)) {
+      const steps = [
+        ["vis-200", vis, 200],
+        ["vis-404", vis, 404],
+        ["hid-200", hid, 200],
+        ["hid-404", hid, 404]
+      ];
+      for (let i = 0; i < steps.length; i += 1) {
+        const st = steps[i];
+        const label = st[0];
+        const panel = st[1];
+        const code = st[2];
+        try {
+          $.Schedule(1.5 + i * 1.5, function () {
+            State.cur31 = label;
+            dlog("31-① TRIGGER " + label);
+            try { panel.SetImage("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_img?code=" + code + "&n=" + label); }
+            catch (e) { dlog("31-① SetImage THREW: " + expErr(e)); }
+          });
+        } catch (e) {}
+        try {
+          $.Schedule(1.5 + i * 1.5 + 1.1, function () {
+            const cnt = State.diff31[label] || 0;
+            dlog("31-① RESULT[" + label + "] = " + (cnt ? "FIRED x" + cnt : "NO-EVENT"));
+          });
+        } catch (e) {}
+      }
+      dlog("31-① steps queued: vis-200/vis-404/hid-200/hid-404, 1.5s apart");
+    } else {
+      dlog("31-① panels missing, diff skipped");
+    }
+
+    // 汇总(最后一步 1.5+3*1.5+1.1=7.1s; 留余量)
+    try {
+      $.Schedule(9.0, function () {
+        const parts = [];
+        const labels = ["vis-200", "vis-404", "hid-200", "hid-404"];
+        for (const lb of labels) parts.push(lb + ":" + ((State.diff31 && State.diff31[lb]) ? "FIRED" : "NO"));
+        dlog("31-SUM diff = " + parts.join(" | "));
+        dlog("31-SUM ImageLoaded total=" + (State.img31Total || 0) + " (other logged " + (State.img31Logged || 0) + ")");
+        dlog("31-SUM done");
+      });
+    } catch (e) {}
+  }
+
+  // ============= EXP6732: Bridge→Panorama 最后一公里闭环 =============
+  // 规则(6731 教训): ① 每面板只 SetImage 一次,永不覆盖; ② 不轮询判定,handler 自报告; ③ +10s 汇总。
+  // 结构: P200/P404/P500/PRefused 四面板各一发; P200/P404 同时挂 Unhandled + RegisterEventHandler 双路回调。
+  // 期望: P200 双路 FIRED / P404·P500·PR 双路 NO = 状态码位元通道成立。
+  function runExp6732() {
+    if (State.exp6732Done) return;
+    State.exp6732Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6732 start v" + VERSION + " ts=" + ts);
+
+    const mk = function (id) {
+      let p = null;
+      try { p = findChild(getRoot(), id); } catch (e) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), id); } catch (e) {}
+        if (isValid(p)) {
+          try { p.visible = true; p.style.width = "2px"; p.style.height = "2px"; p.style.x = "0px"; p.style.y = "0px"; } catch (e) {}
+        }
+      }
+      return p;
+    };
+    const p200 = mk("LCTP200");
+    const p404 = mk("LCTP404");
+    const p500 = mk("LCTP500");
+    const pr = mk("LCTPR");
+    dlog("32 panels: 200=" + !!p200 + " 404=" + !!p404 + " 500=" + !!p500 + " refused=" + !!pr);
+
+    State.diff32 = {};
+    State.img32Total = 0;
+    State.img32Other = 0;
+
+    // ---- 双路回调之 1: RegisterForUnhandledEvent(全局面) ----
+    try {
+      $.RegisterForUnhandledEvent("ImageLoaded", function (panel, a1) {
+        State.img32Total += 1;
+        let pid = "";
+        try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+        if (pid === "LCTP200" || pid === "LCTP404" || pid === "LCTP500" || pid === "LCTPR") {
+          State.diff32[pid] = (State.diff32[pid] || 0) + 1;
+          dlog("32-① UNHANDLED FIRED id=" + pid + " t=" + nowMs() + " a1=" + expDumpVal(a1));
+        } else if (State.img32Other < 4) {
+          State.img32Other += 1;
+          dlog("32-① other#" + State.img32Other + " id=\"" + pid + "\" total=" + State.img32Total);
+        }
+      });
+      dlog("32-① unhandled ImageLoaded registered");
+    } catch (e) { dlog("32-① unhandled THREW: " + expErr(e)); }
+
+    // ---- 双路回调之 2: RegisterEventHandler(面板绑定, 6731 已验签名) ----
+    const rehFn = function (tag) {
+      return function () {
+        State.diff32["REH:" + tag] = (State.diff32["REH:" + tag] || 0) + 1;
+        const parts = [];
+        for (let i = 0; i < arguments.length && i < 5; i += 1) parts.push("a" + i + "=" + expDumpVal(arguments[i]));
+        dlog("32-② REH FIRED id=" + tag + " t=" + nowMs() + " (" + arguments.length + "a): " + parts.join(" | ").slice(0, 400));
+      };
+    };
+    if (isValid(p200)) {
+      try { $.RegisterEventHandler("ImageLoaded", p200, rehFn("LCTP200")); dlog("32-② REH registered on P200"); }
+      catch (e) { dlog("32-② REH(P200) THREW: " + expErr(e)); }
+    }
+    if (isValid(p404)) {
+      try { $.RegisterEventHandler("ImageLoaded", p404, rehFn("LCTP404")); dlog("32-② REH registered on P404"); }
+      catch (e) { dlog("32-② REH(P404) THREW: " + expErr(e)); }
+    }
+
+    // ---- 单发差分: 每面板只 SetImage 一次,永不覆盖; 0.5s 错开 ----
+    const shots = [
+      ["LCTP200", p200, "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_img?code=200&n=e32p200"],
+      ["LCTP404", p404, "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_img?code=404&n=e32p404"],
+      ["LCTP500", p500, "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_img?code=500&n=e32p500"],
+      ["LCTPR", pr, "http://localhost:8799/refused.png?n=e32pr"]
+    ];
+    let shotN = 0;
+    for (const sh of shots) {
+      const label = sh[0];
+      const panel = sh[1];
+      const url = sh[2];
+      if (!isValid(panel)) { dlog("32-① SHOT[" + label + "] panel missing, skipped"); continue; }
+      shotN += 1;
+      try {
+        $.Schedule(1.5 + shotN * 0.5, function () {
+          dlog("32-① SHOT[" + label + "] ONE-SHOT t=" + nowMs());
+          try { panel.SetImage(url); } catch (e) { dlog("32-① SetImage THREW: " + expErr(e)); }
+        });
+      } catch (e) { dlog("32-① schedule THREW: " + expErr(e)); }
+    }
+    dlog("32-① " + shotN + " one-shot panels queued (no retarget ever)");
+
+    // ---- 汇总: +10s, 只报告, 不提前判定 ----
+    try {
+      $.Schedule(10.0, function () {
+        const pids = ["LCTP200", "LCTP404", "LCTP500", "LCTPR"];
+        const parts = [];
+        for (const pid of pids) parts.push(pid + ":" + ((State.diff32[pid]) ? "FIRED x" + State.diff32[pid] : "NO"));
+        dlog("32-SUM unhandled = " + parts.join(" | "));
+        const rp = [];
+        rp.push("REH:200:" + (State.diff32["REH:LCTP200"] ? "FIRED" : "NO"));
+        rp.push("REH:404:" + (State.diff32["REH:LCTP404"] ? "FIRED" : "NO"));
+        dlog("32-SUM reh = " + rp.join(" | "));
+        dlog("32-SUM other traffic total=" + State.img32Total + " (other logged " + State.img32Other + ")");
+        dlog("32-SUM done");
+      });
+    } catch (e) {}
+  }
+
+  // ============= EXP6733: 302 重定向 + Image 面板 URL/src 回读 =============
+  // 核心问题只有一个: ImageLoaded 回调里能否读到实际加载的 image URL/src/path?
+  //   T1(P33A): 直接 /probe?...&d=BT_ORIG33 —— src 可读性基线
+  //   T2(P33B): /redir302?o=BT_ORIG33&f=BT_FINAL33 -> 302 /rdata?f=BT_FINAL33
+  //     读到 BT_FINAL33 = 最终 URL 可读 = ⭐文本入站(数量级提升)
+  //     只读到 BT_ORIG33 = 跟随了但只暴露原 URL = 无增益
+  //     桥无 PROBE-RDATA = 引擎不跟随重定向
+  // 面板规则: 单发不覆盖(6731 教训); 双路回调; +11s 汇总。
+  function runExp6733() {
+    if (State.exp6733Done) return;
+    State.exp6733Done = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6733 start v" + VERSION + " ts=" + ts);
+
+    const mk = function (id) {
+      let p = null;
+      try { p = findChild(getRoot(), id); } catch (e) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), id); } catch (e) {}
+        if (isValid(p)) {
+          try { p.visible = true; p.style.width = "2px"; p.style.height = "2px"; p.style.x = "0px"; p.style.y = "0px"; } catch (e) {}
+        }
+      }
+      return p;
+    };
+    const pA = mk("LCTP33A");
+    const pB = mk("LCTP33B");
+    dlog("33 panels: A(plain)=" + !!pA + " B(redirect)=" + !!pB);
+
+    // ---- 字符串回读: 全属性扫描(URL类) + 加载前后变化 diff + 候选方法/属性 ----
+    const snapStrings = function (panel) {
+      const m = {};
+      try {
+        const names = Object.getOwnPropertyNames(panel);
+        for (const n of names) {
+          try { const v = panel[n]; if (typeof v === "string") m[n] = v; } catch (e) {}
+        }
+      } catch (e) {}
+      return m;
+    };
+    const readback = function (pid, panel, before) {
+      const hits = [];
+      const after = snapStrings(panel);
+      // 1) 变化检测(加载后新增/改变的字符串属性)
+      for (const n in after) {
+        const v = after[n];
+        if (before[n] !== v) {
+          const bv = before[n] === undefined ? "<none>" : before[n];
+          hits.push("CHANGED " + n + ": " + String(bv).slice(0, 80) + " -> " + String(v).slice(0, 300));
+        }
+      }
+      // 2) URL 类扫描(无论变没变)
+      for (const n in after) {
+        const v = after[n];
+        const lv = v.toLowerCase();
+        if (lv.indexOf("http") !== -1 || v.indexOf("BT_") !== -1 || lv.indexOf(".png") !== -1 || lv.indexOf("rdata") !== -1) {
+          if (!hits.some(function (h) { return h.indexOf(n + ":") !== -1; })) hits.push("URLLIKE " + n + "=" + v.slice(0, 300));
+        }
+      }
+      // 3) 候选属性读取 API
+      if (typeof panel.GetAttributeString === "function") {
+        const attrs = ["src", "image", "imagepath", "url", "texture", "backgroundimage"];
+        for (const a of attrs) {
+          try { const s = panel.GetAttributeString(a, ""); if (s) hits.push("attr:" + a + "=" + String(s).slice(0, 300)); } catch (e) {}
+        }
+      }
+      // 4) 候选读取方法
+      const fns = ["GetImage", "GetImageURL", "GetImagePath", "GetTextureName", "GetUrl"];
+      for (const m of fns) {
+        if (typeof panel[m] === "function") {
+          try { const r = panel[m](); if (r) hits.push("fn:" + m + "()=" + String(r).slice(0, 300)); }
+          catch (e) { hits.push("fn:" + m + " THREW:" + expErr(e)); }
+        }
+      }
+      return hits;
+    };
+
+    State.base33 = {};
+    State.loaded33 = {};
+    State.readback33 = {};
+
+    const onLoaded33 = function (via, panel) {
+      let pid = "";
+      try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+      if (pid !== "LCTP33A" && pid !== "LCTP33B") return;
+      State.loaded33[pid] = (State.loaded33[pid] || 0) + 1;
+      if (State.readback33[pid]) return; // 只回读一次
+      try {
+        const hits = readback(pid, panel, State.base33[pid] || {});
+        State.readback33[pid] = hits.length;
+        dlog("33 READBACK[" + pid + "] via " + via + " hits=" + hits.length + ": " + hits.join(" || ").slice(0, 900));
+      } catch (e) { dlog("33 READBACK[" + pid + "] THREW: " + expErr(e)); }
+    };
+
+    // 双路回调
+    try {
+      $.RegisterForUnhandledEvent("ImageLoaded", function (panel) { onLoaded33("unhandled", panel); });
+      dlog("33 unhandled registered");
+    } catch (e) { dlog("33 unhandled THREW: " + expErr(e)); }
+    if (isValid(pA)) {
+      try { $.RegisterEventHandler("ImageLoaded", pA, function () { onLoaded33("REH", pA); }); dlog("33 REH registered on A"); }
+      catch (e) { dlog("33 REH(A) THREW: " + expErr(e)); }
+    }
+    if (isValid(pB)) {
+      try { $.RegisterEventHandler("ImageLoaded", pB, function () { onLoaded33("REH", pB); }); dlog("33 REH registered on B"); }
+      catch (e) { dlog("33 REH(B) THREW: " + expErr(e)); }
+    }
+
+    // 基线快照(加载前)
+    try {
+      $.Schedule(1.5, function () {
+        if (isValid(pA)) State.base33["LCTP33A"] = snapStrings(pA);
+        if (isValid(pB)) State.base33["LCTP33B"] = snapStrings(pB);
+        dlog("33 baseline captured (A strings=" + Object.keys(State.base33["LCTP33A"] || {}).length +
+          ", B strings=" + Object.keys(State.base33["LCTP33B"] || {}).length + ")");
+      });
+    } catch (e) {}
+
+    // 单发两枪
+    if (isValid(pA)) {
+      try {
+        $.Schedule(2.0, function () {
+          dlog("33 SHOT[T1-plain] LCTP33A t=" + nowMs());
+          try { pA.SetImage("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe?seq=33a&d=BT_ORIG33"); }
+          catch (e) { dlog("33 SetImage(A) THREW: " + expErr(e)); }
+        });
+      } catch (e) {}
+    }
+    if (isValid(pB)) {
+      try {
+        $.Schedule(2.5, function () {
+          dlog("33 SHOT[T2-redirect] LCTP33B t=" + nowMs());
+          try { pB.SetImage("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/redir302?o=BT_ORIG33&f=BT_FINAL33"); }
+          catch (e) { dlog("33 SetImage(B) THREW: " + expErr(e)); }
+        });
+      } catch (e) {}
+    }
+
+    // 汇总
+    try {
+      $.Schedule(11.0, function () {
+        const aL = State.loaded33["LCTP33A"] || 0;
+        const bL = State.loaded33["LCTP33B"] || 0;
+        dlog("33-SUM T1(plain) loaded=" + aL + " readbackHits=" + (State.readback33["LCTP33A"] !== undefined ? State.readback33["LCTP33A"] : "n/a"));
+        dlog("33-SUM T2(redirect) loaded=" + bL + " readbackHits=" + (State.readback33["LCTP33B"] !== undefined ? State.readback33["LCTP33B"] : "n/a"));
+        dlog("33-SUM done (check PROBE-REDIR/PROBE-RDATA in bridge log)");
+      });
+    } catch (e) {}
+  }
+
+  // ============= EXP6734-A: Image 面板全方法名枚举(只枚举,零调用) =============
+  // 目的: 关死/捡漏 src 回读 —— 找 GetImage/GetURL/GetSource/GetTexture/GetPath/GetFile 类 accessor。
+  // 规则: 只 typeof + 名字过滤,绝不调用;命中与全量名单都贴回。
+  function runExp6734A() {
+    if (State.exp6734ADone) return;
+    State.exp6734ADone = true;
+    const ts = String(nowMs()).slice(-6);
+    dlog("exp6734A start v" + VERSION + " ts=" + ts);
+
+    let p = null;
+    try { p = findChild(getRoot(), "LCTP34A"); } catch (e0) {}
+    if (!isValid(p)) {
+      try { p = $.CreatePanel("Image", getRoot(), "LCTP34A"); } catch (e) {}
+      if (isValid(p)) {
+        try { p.visible = true; p.style.width = "2px"; p.style.height = "2px"; p.style.x = "0px"; p.style.y = "0px"; } catch (e) {}
+      }
+    }
+    dlog("34-A panel=" + !!p);
+    if (!isValid(p)) { dlog("34-A panel missing, abort"); return; }
+
+    const KW = ["image", "url", "src", "texture", "path", "file"];
+    const enumFns = function (tag) {
+      if (State.enum34Done) return;
+      State.enum34Done = true;
+      try {
+        const seen = {};
+        const all = [];
+        try {
+          const own = Object.getOwnPropertyNames(p);
+          for (const n of own) { if (!seen[n]) { seen[n] = 1; all.push(n); } }
+        } catch (e) {}
+        try {
+          for (const n in p) { if (!seen[n]) { seen[n] = 1; all.push(n); } }
+        } catch (e) {}
+        const fns = [];
+        const hits = [];
+        for (const n of all) {
+          let t = "";
+          try { t = typeof p[n]; } catch (e) { continue; }
+          if (t !== "function") continue;
+          fns.push(n);
+          const lo = String(n).toLowerCase();
+          for (const k of KW) {
+            if (lo.indexOf(k) !== -1) { hits.push(n); break; }
+          }
+        }
+        dlog("34-A[" + tag + "] hits(" + hits.length + "): " + (hits.length ? hits.join(", ") : "EMPTY"));
+        dlog("34-A[" + tag + "] total functions: " + fns.length);
+        expChunk("34-A[" + tag + "] all fns", fns.join(","));
+        dlog("34-A[" + tag + "] done (do NOT call any of these until reviewed)");
+      } catch (e) { dlog("34-A enum THREW: " + expErr(e)); }
+    };
+
+    // 双路回调(只记 loaded,枚举在 loaded 或 6s 兜底里跑一次)
+    try {
+      $.RegisterForUnhandledEvent("ImageLoaded", function (panel) {
+        let pid = "";
+        try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+        if (pid !== "LCTP34A") return;
+        dlog("34-A LOADED id=" + pid + " t=" + nowMs());
+        enumFns("onload");
+      });
+    } catch (e) { dlog("34-A unhandled THREW: " + expErr(e)); }
+    try {
+      $.RegisterEventHandler("ImageLoaded", p, function () { dlog("34-A REH LOADED"); enumFns("reh"); });
+    } catch (e) { dlog("34-A REH THREW: " + expErr(e)); }
+
+    // 单发一枪
+    try {
+      $.Schedule(2.0, function () {
+        dlog("34-A SHOT t=" + nowMs());
+        try { p.SetImage("http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe?seq=34a&d=BT_34A"); }
+        catch (e) { dlog("34-A SetImage THREW: " + expErr(e)); }
+      });
+    } catch (e) {}
+    // 兜底: 6s 还没 loaded 也枚举(方法是静态的,不依赖加载)
+    try { $.Schedule(8.0, function () { enumFns("fallback"); dlog("34-A fallback check done"); }); } catch (e) {}
+  }
+
+  // ============= EXP6734-B: 真实对局 64 面板 × 20 轮延迟测试 =============
+  // 手动触发: 进对局(可移动后)聊天输入 /bt6734b。
+  // 规格: 64 面板一批 → 全到齐(或 12s 超时)才开下一轮 → 20 轮;
+  //       dt 在游戏内用引擎毫秒算(shot→ImageLoaded),不受日志尾随延迟影响;
+  //       上报只走 $.Msg → console.log tail(1280 行不走信标,防 0.2s 队列积压)。
+  function runExp6734B() {
+    if (State.bitRunning) { log("exp6734B: already running, ignore"); return; }
+    State.bitRunning = true;
+    State.bitRound = 0;
+    const N = 64;
+    const ROUNDS = 20;
+    log("exp6734B: START v" + VERSION + " rounds=" + ROUNDS + " panels=" + N);
+
+    // 64 面板(隐藏;复用防重建)
+    const panels = [];
+    for (let i = 0; i < N; i += 1) {
+      const id = "BTBIT" + i;
+      let p = null;
+      try { p = findChild(getRoot(), id); } catch (e) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), id); } catch (e) {}
+        if (isValid(p)) { try { p.visible = false; p.style.width = "2px"; p.style.height = "2px"; } catch (e) {} }
+      }
+      if (isValid(p)) panels.push(p);
+    }
+    log("exp6734B: panels ready " + panels.length + "/" + N);
+    if (panels.length < N) {
+      log("exp6734B: ABORT (not enough panels)");
+      State.bitRunning = false;
+      return;
+    }
+    State.bitPanels = panels;
+
+    // ImageLoaded 处理(每会话只注册一次,状态全走 State 防闭包陈旧)
+    if (!State.bitHandlerOn) {
+      State.bitHandlerOn = true;
+      try {
+        $.RegisterForUnhandledEvent("ImageLoaded", function (panel) {
+          let pid = "";
+          try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+          if (pid.slice(0, 5) !== "BTBIT") return;
+          if (!State.bitActive) return;
+          if (State.bitIds[pid]) return;
+          State.bitIds[pid] = 1;
+          const dt = nowMs() - State.bitT0;
+          State.bitLoaded += 1;
+          if (State.bitMin === null || dt < State.bitMin) State.bitMin = dt;
+          if (State.bitMax === null || dt > State.bitMax) State.bitMax = dt;
+          log("exp6734B: LOADED id=" + pid + " dt=" + dt);
+          if (State.bitLoaded >= State.bitPanels.length) bitFinishRound();
+        });
+      } catch (e) { log("exp6734B: handler THREW " + expErr(e)); }
+    }
+
+    const bitStartRound = function () {
+      State.bitRound += 1;
+      State.bitActive = true;
+      State.bitIds = {};
+      State.bitLoaded = 0;
+      State.bitMin = null;
+      State.bitMax = null;
+      State.bitT0 = nowMs();
+      log("exp6734B: ROUND=" + State.bitRound + " SHOT t=" + State.bitT0);
+      for (let i = 0; i < State.bitPanels.length; i += 1) {
+        try {
+          State.bitPanels[i].SetImage(
+            "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_bit?id=BTBIT" + i + "&round=" + State.bitRound
+          );
+        } catch (e) { log("exp6734B: SetImage THREW " + expErr(e)); }
+      }
+      const myRound = State.bitRound;
+      try {
+        $.Schedule(12.0, function () {
+          if (State.bitRound !== myRound || !State.bitActive) return; // 本轮已正常完成
+          log("exp6734B: ROUND=" + myRound + " TIMEOUT loaded=" + State.bitLoaded + "/" + State.bitPanels.length);
+          bitFinishRound();
+        });
+      } catch (e) {}
+    };
+
+    function bitFinishRound() {
+      if (!State.bitActive) return;
+      State.bitActive = false;
+      log("exp6734B: ROUND=" + State.bitRound + " DONE loaded=" + State.bitLoaded + "/" + State.bitPanels.length +
+        " min=" + State.bitMin + " max=" + State.bitMax + " t0=" + State.bitT0);
+      if (State.bitRound >= ROUNDS) {
+        log("exp6734B: ALL DONE (" + ROUNDS + " rounds complete)");
+        State.bitRunning = false;
+      } else {
+        try { $.Schedule(1.5, bitStartRound); }
+        catch (e) { log("exp6734B: schedule THREW " + expErr(e)); State.bitRunning = false; }
+      }
+    }
+
+    bitStartRound();
+  }
+
+  // ============= EXP6734-C: 聊天输入框 TextEntry 控制 =============
+  // C-1 树扫描找 TextEntry(能力探测,不猜名) → C-2 面板枚举 → C-3 只读 → C-4 改 p.text →
+  // C-5 两段手动 Enter 判定: 发出的是原文还是改后文(= 发送前翻译"回填 TextEntry"路线判定)
+  // 触发: 聊天输兣 /bt6734c;不自动 Enter,第1下拦截改写,第2下才真发送;/ 开头命令可退出布防。
+  function exp6734cChunk(prefix, s) {
+    const size = 480;
+    if (!s.length) { log("exp6734C: " + prefix + "#0 <empty>"); return; }
+    for (let i = 0; i < s.length; i += size) log("exp6734C: " + prefix + "#" + (i / size) + ": " + s.slice(i, i + size));
+  }
+
+  // C-1: 从根面板递归扫(不猜名),收集一切带 text 属性的面板,探测 TextEntry 特征方法
+  function exp6734cScanTree() {
+    const root = getRoot();
+    const found = [];
+    let scanned = 0;
+    const TE_PROBES = ["GetMaxChars", "SetMaxChars", "SetSelectedText", "GetSelectedText", "InsertString", "MoveCursorEnd", "SetDisabled"];
+    const visit = function (p, depth) {
+      if (!isValid(p) || depth > 25 || scanned > 4000) return;
+      scanned += 1;
+      let hasText = false;
+      try { hasText = typeof p.text === "string"; } catch (e) {}
+      if (hasText) {
+        let id = "", ty = "?", cls = "";
+        const hits = [];
+        try { id = String(p.id || ""); } catch (e) {}
+        try { if (typeof p.type === "string") ty = p.type; } catch (e) {}
+        try { if (typeof p.GetPanelClassList === "function") cls = String(p.GetPanelClassList().join(",")); } catch (e) {}
+        for (let i = 0; i < TE_PROBES.length; i += 1) {
+          try { if (typeof p[TE_PROBES[i]] === "function") hits.push(TE_PROBES[i]); } catch (e) {}
+        }
+        let cur = "";
+        try { cur = String(p.text).slice(0, 40); } catch (e) {}
+        found.push({ id: id || "?", ty: ty, cls: cls, hits: hits.join("|") || "-", text: cur });
+      }
+      const n = childCount(p);
+      for (let i = 0; i < n; i += 1) visit(childAt(p, i), depth + 1);
+    };
+    visit(root, 0);
+    log("exp6734C: C1 scan panels=" + scanned + " textCapable=" + found.length);
+    for (let i = 0; i < found.length && i < 60; i += 1) {
+      const f = found[i];
+      log("exp6734C: C1 [" + i + "] id=" + f.id + " type=" + f.ty + " te-hits=" + f.hits + " cls=" + f.cls.slice(0, 70) + " text=" + JSON.stringify(f.text));
+    }
+    if (found.length > 60) log("exp6734C: C1 ... +" + (found.length - 60) + " more");
+    let known = null;
+    try { known = findChild(root, CHAT_INPUT_ID); } catch (e) {}
+    log("exp6734C: C1 knownId ChatInput found=" + (isValid(known) ? "yes" : "no"));
+    return found;
+  }
+
+  // C-5 观测: 从第1下 Enter 起,对 chat/lobby/hud 消息容器做基线后增量行分类
+  // 分类优先级: 含唯一标记 → SENT=MODIFIED;仅含原文且 IsSelf → SENT=ORIGINAL
+  function exp6734cObsStart(st) {
+    const containers = function () {
+      const out = [];
+      try { const m = resolveChatMessages(); if (m) out.push({ k: "chat", p: m }); } catch (e) {}
+      try { const l = resolveLobbyMessages(); if (l) out.push({ k: "lobby", p: l }); } catch (e) {}
+      try {
+        resolveHudMessages();
+        for (let i = 0; i < State.hudMessages.length; i += 1) out.push({ k: "hud" + i, p: State.hudMessages[i] });
+      } catch (e) {}
+      return out;
+    };
+    const bl = {};
+    const cs0 = containers();
+    for (let i = 0; i < cs0.length; i += 1) {
+      try { bl[cs0[i].k] = childCount(cs0[i].p); } catch (e) { bl[cs0[i].k] = 0; }
+    }
+    st.hits = st.hits || [];
+    st.logged = st.logged || {};
+    const ticks = [0.5, 1.2, 2.5, 4.5, 7.5, 11.0];
+    let idx = 0;
+    const step = function () {
+      if (State.c5obs !== st || st.done) return;
+      const cs = containers();
+      for (let ci = 0; ci < cs.length; ci += 1) {
+        const c = cs[ci];
+        let n = 0;
+        try { n = childCount(c.p); } catch (e) { continue; }
+        if (typeof bl[c.k] !== "number") bl[c.k] = n; // 中途新出现的容器: 从当前水位起数
+        const start = Math.min(bl[c.k], Math.max(0, n - 3)); // 已知基线 + 永远兼顾末3行
+        for (let i = start; i < n; i += 1) {
+          const row = childAt(c.p, i);
+          let txt = "";
+          try { txt = collectText(row); } catch (e) {}
+          if (!txt) continue;
+          let kind = "";
+          if (st.marker && txt.indexOf(st.marker) >= 0) kind = "SENT=MODIFIED";
+          else if (st.orig && txt.indexOf(st.orig) >= 0) {
+            let own = false;
+            try { own = hasClass(row, "IsSelf") || !!findClass(row, LOCAL_CLIENT_ID); } catch (e) {}
+            if (own) kind = "SENT=ORIGINAL";
+          }
+          if (!kind) continue;
+          const key = c.k + "#" + i + "#" + txt.slice(0, 20);
+          if (st.logged[key]) continue;
+          st.logged[key] = true;
+          st.hits.push(kind);
+          log("exp6734C: C5 row[" + c.k + "#" + i + "] " + kind + " text=" + JSON.stringify(txt.slice(0, 120)));
+        }
+        bl[c.k] = Math.max(bl[c.k], n); // 水位推进(已扫过的不重扫;末3行由 start 兼顾)
+      }
+      // 出结论: 双命中,或已发第2下且有命中(再补一拍),或打点用尽
+      const hasM = st.hits.indexOf("SENT=MODIFIED") >= 0;
+      const hasO = st.hits.indexOf("SENT=ORIGINAL") >= 0;
+      const last = idx >= ticks.length - 1;
+      if ((hasM && hasO) || (last) || (st.sent2 && (hasM || hasO) && idx >= 3)) {
+        st.done = true;
+        let verdict = "NOT_SENT";
+        if (hasM && hasO) verdict = "BOTH (第1下原生发了原文?第2下又发了改后文,见上方 row 日志)";
+        else if (hasM) verdict = "SENT=MODIFIED (改后文被发送 → 回填+发送链路成立)";
+        else if (hasO) verdict = "SENT=ORIGINAL (原文被发送 → 引擎不吃 p.text 改写)";
+        log("exp6734C: C5-RESULT " + verdict + " sent2=" + !!st.sent2 + " orig=" + JSON.stringify(String(st.orig || "").slice(0, 40)));
+        State.c5obs = null;
+        return;
+      }
+      idx += 1;
+      if (idx < ticks.length) { try { $.Schedule(ticks[idx], step); } catch (e) {} }
+      else {
+        st.done = true;
+        log("exp6734C: C5-RESULT NOT_SENT (11s 未见新行; sent2=" + !!st.sent2 + ")");
+        State.c5obs = null;
+      }
+    };
+    State.c5obs = st;
+    try { $.Schedule(ticks[0], step); } catch (e) { log("exp6734C: obs schedule threw " + expErr(e)); }
+  }
+
+  // C-5 两段 Enter 拦截: wait=第1下(改写不发送) / send=第2下(与正常路径同语义发送)
+  function exp6734cSubmitHook(input, trimmed) {
+    try {
+      const st = State.c5;
+      if (!st) return false;
+      if (trimmed.charAt(0) === "/") {
+        log("exp6734C: disarm by command " + JSON.stringify(trimmed.slice(0, 40)));
+        State.c5 = null;
+        return false;
+      }
+      if (st.phase === "wait") {
+        if (!trimmed) return true; // 布防中空回车吞掉
+        st.orig = trimmed;
+        st.marker = "LCTC" + String(nowMs()).slice(-6) + "M";
+        const modified = st.marker + " " + trimmed.slice(0, 60);
+        let wOk = false, rb = "";
+        try { input.text = modified; wOk = true; } catch (e) { log("exp6734C: C5 write threw " + expErr(e)); }
+        try { rb = String(input.text || ""); } catch (e) {}
+        log("exp6734C: C3 userText=" + JSON.stringify(trimmed.slice(0, 80)));
+        log("exp6734C: C4 rewrite=" + wOk + " readback=" + JSON.stringify(rb.slice(0, 90)) + " match=" + (rb === modified));
+        st.phase = "send";
+        exp6734cObsStart(st);
+        log("exp6734C: C5 phase=send — 输入框已改写,再次按回车才发送(观察原文还是改后文)");
+        return true; // 第1下: 不发送
+      }
+      if (st.phase === "send") {
+        if (!trimmed) { log("exp6734C: C5 submit#2 empty, 保持 phase=send"); return true; }
+        const isRewritten = trimmed === st.marker + " " + String(st.orig || "").slice(0, 60);
+        log("exp6734C: C5 submit#2 raw=" + JSON.stringify(trimmed.slice(0, 90)) + " isRewritten=" + isRewritten);
+        try { input.text = trimmed; } catch (e) {}
+        triggerStockSubmit(input);
+        clearInput();
+        st.sent2 = true;
+        State.c5 = null; // 布防结束,观测经 State.c5obs 继续
+        log("exp6734C: C5 stock submit dispatched (normal-path semantics)");
+        return true;
+      }
+      State.c5 = null;
+      return false;
+    } catch (e) {
+      log("exp6734C: hook error " + expErr(e) + " — disarm");
+      State.c5 = null;
+      return false; // 出错必放行走正常路径,绝不吞用户消息
+    }
+  }
+
+  function runExp6734C(input, cmd) {
+    log("exp6734C: START v" + VERSION);
+    // ---- C-1 树扫描 ----
+    exp6734cScanTree();
+    // ---- 定位目标输入框(能力扫描优先,回退本 mod XML 已知 id) ----
+    const inp = (isValid(input) ? input : null) || State.input || findChild(getRoot(), CHAT_INPUT_ID);
+    if (!isValid(inp)) { log("exp6734C: ABORT — no TextEntry(input) found"); return; }
+    let inpId = "?";
+    try { inpId = String(inp.id || "?"); } catch (e) {}
+    // ---- C-2 面板枚举(只读) ----
+    let names = [];
+    try { names = Object.getOwnPropertyNames(inp); } catch (e) { log("exp6734C: C2 getOwnPropertyNames threw " + expErr(e)); }
+    exp6734cChunk("C2 input[" + inpId + "] ownProps", names.join(","));
+    // ---- C-3 只读当前内容(此刻应为命令串自身) ----
+    let cur = "";
+    try { cur = String(inp.text || ""); } catch (e) { log("exp6734C: C3 read threw " + expErr(e)); }
+    log("exp6734C: C3 read id=" + inpId + " text=" + JSON.stringify(cur.slice(0, 60)) + " matchCmd=" + (cur.trim() === cmd));
+    // ---- C-4 写+读回(写完即清,恢复空白输入框) ----
+    const wmark = "LCTW" + String(nowMs()).slice(-6);
+    let wOk = false, rb = "";
+    try { inp.text = wmark; wOk = true; } catch (e) { log("exp6734C: C4 write threw " + expErr(e)); }
+    try { rb = String(inp.text || ""); } catch (e) {}
+    log("exp6734C: C4 write=" + wOk + " readback=" + JSON.stringify(rb.slice(0, 60)) + " match=" + (rb === wmark));
+    clearInput();
+    // ---- 布防 C-5 ----
+    const st = { phase: "wait", t0: nowMs(), marker: "", orig: "", sent2: false, done: false };
+    State.c5 = st;
+    State.c5obs = null;
+    try {
+      $.Schedule(120.0, function () {
+        if (State.c5 === st) {
+          log("exp6734C: C5 timeout (120s) disarm phase=" + st.phase);
+          State.c5 = null;
+        }
+      });
+    } catch (e) {}
+    log("exp6734C: ARMED — 输入测试文本按回车(第1下: 拦截改写不发送),再按回车(第2下: 真正发送);输入 / 开头命令即退出布防");
+  }
+
+  // ============= EXP6734-D: Bridge→Panorama 下行吞吐基准 =============
+  // 目的: 用实测数据钉死 BTIPC v1 的 MAX_SAFE_PAYLOAD / SAFE_WINDOW / FRAME_TIMEOUT,帧规格不拍脑袋定。
+  // 矩阵 D1~D6: 面板数 16/32/64/96/128/256 × 每面板 1 bit × 20 轮;
+  // 窗口 W1~W5: 256 bit 帧按窗口 16/32/64/96/128 分批发射 × 10 轮(协议帧 ≠ 一次性发射的面板数)。
+  // 触发: 对局内聊天 /bt6734d | /bt6734d <8..512> | /bt6734d win
+  // 面板: 自建 Image 前缀 BTD*(与 6734-B 的 BTBIT* 严格隔离,两套 ImageLoaded handler 互不干扰),
+  //       隐藏 2×2 复用;URL 带 c=<cfg>@<runTag> 击穿缓存 + 服务端按配置分组。
+  // 指标行: LOADED(每 bit dt/seq) / WIN(每窗) / ROUND DONE|TIMEOUT(word/first/last/min/max/lost) / DUP / STALE
+  // 分析: node scripts/exp6734d_analyze.js logs/bridge.log
+  const EXP6734D_MATRIX = [16, 32, 64, 96, 128, 256];
+  const EXP6734D_WINS = [16, 32, 64, 96, 128];
+
+  function runExp6734D(arg) {
+    if (State.dRunning) { log("exp6734D: already running, ignore"); return; }
+    if (State.bitRunning) { log("exp6734D: 6734-B running, refuse(防两套探针互相污染)"); return; }
+
+    // ---- 计划 ----
+    const plan = [];
+    if (arg === "win" || arg === "w") {
+      for (let i = 0; i < EXP6734D_WINS.length; i += 1) {
+        plan.push({ cfg: "256w" + EXP6734D_WINS[i], n: 256, win: EXP6734D_WINS[i], rounds: 10 });
+      }
+    } else if (arg === "") {
+      for (let i = 0; i < EXP6734D_MATRIX.length; i += 1) {
+        plan.push({ cfg: String(EXP6734D_MATRIX[i]), n: EXP6734D_MATRIX[i], win: 1, rounds: 20 });
+      }
+    } else {
+      const n = parseInt(arg, 10);
+      if (!(n >= 8 && n <= 512)) {
+        log("exp6734D: 参数无效 " + JSON.stringify(arg) + " — 用法: /bt6734d | /bt6734d <8..512> | /bt6734d win");
+        return;
+      }
+      plan.push({ cfg: String(n), n: n, win: 1, rounds: 20 });
+    }
+
+    // ---- 面板池(前缀 BTD*) ----
+    let maxN = 0;
+    for (let i = 0; i < plan.length; i += 1) if (plan[i].n > maxN) maxN = plan[i].n;
+    const panels = [];
+    let created = 0;
+    for (let i = 0; i < maxN; i += 1) {
+      const pid = "BTD" + i;
+      let p = null;
+      try { p = findChild(getRoot(), pid); } catch (e) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), pid); } catch (e) {}
+        if (isValid(p)) {
+          created += 1;
+          try { p.visible = false; p.style.width = "2px"; p.style.height = "2px"; } catch (e) {}
+        }
+      }
+      if (isValid(p)) panels.push(p);
+      else log("exp6734D: panel " + pid + " invalid");
+    }
+    const runTag = String(nowMs()).slice(-6);
+    log("exp6734D: START v" + VERSION + " run=" + runTag + " plan=" +
+        plan.map(function (c) { return c.cfg; }).join(",") +
+        " panels=" + panels.length + "/" + maxN + " (new=" + created + ")");
+    if (panels.length < maxN) {
+      log("exp6734D: ABORT (面板不足 " + panels.length + "/" + maxN + ")");
+      return;
+    }
+
+    State.dRunning = true;
+    const st = {
+      runTag: runTag, plan: plan, panels: panels, ci: 0,
+      cfg: "", n: 0, win: 1, rounds: 0, r: 0,
+      active: false, t0: 0, ids: {}, loaded: 0, seq: 0,
+      first: null, last: null, min: null, max: null,
+      winK: 0, winBase: 0, winShots: 0, wLoaded: 0, winT0: 0
+    };
+    State.d = st;
+
+    const tagOf = function (s) { return "n=" + s.cfg + " r=" + s.r; };
+    const winCountOf = function (s) { return Math.ceil(s.n / s.win); };
+    const timeoutMsOf = function (s) {
+      if (s.win <= 1) return 12000;
+      return Math.min(60000, winCountOf(s) * 6000 + 12000);
+    };
+
+    // ---- ImageLoaded(每会话注册一次;状态全走 State.d 防闭包陈旧) ----
+    if (!State.dHandlerOn) {
+      State.dHandlerOn = true;
+      try {
+        $.RegisterForUnhandledEvent("ImageLoaded", function (panel) {
+          let pid = "";
+          try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+          if (pid.slice(0, 3) !== "BTD") return;
+          const s = State.d;
+          if (!s || !s.active) return;
+          const idx = parseInt(pid.slice(3), 10);
+          if (isNaN(idx)) return;
+          const dt = nowMs() - s.t0;
+          if (idx >= s.winShots) { log("exp6734D: STALE " + tagOf(s) + " i=" + idx + " dt=" + dt); return; }
+          if (s.ids[pid]) { log("exp6734D: DUP " + tagOf(s) + " i=" + idx + " dt=" + dt); return; }
+          s.ids[pid] = 1;
+          s.loaded += 1;
+          s.seq += 1;
+          if (s.first === null) s.first = dt;
+          s.last = dt;
+          if (s.min === null || dt < s.min) s.min = dt;
+          if (dt > s.max) s.max = dt;
+          log("exp6734D: LOADED " + tagOf(s) + " i=" + idx + " dt=" + dt + " seq=" + s.seq);
+          if (s.win > 1 && idx >= s.winBase) {
+            s.wLoaded += 1;
+            if (s.wLoaded >= s.winShots - s.winBase) {
+              log("exp6734D: WIN " + tagOf(s) + " k=" + (s.winK + 1) + "/" + winCountOf(s) + " DONE dt=" + (nowMs() - s.winT0));
+              dAdvance();
+            }
+          }
+          if (s.loaded >= s.n) dFinishRound();
+        });
+      } catch (e) { log("exp6734D: handler THREW " + expErr(e)); }
+    }
+
+    // ---- 单窗口发射(	win=1 即整轮一批) ----
+    const dShotWindow = function (k) {
+      const s = State.d;
+      if (!s || !s.active) return;
+      const from = s.win > 1 ? k * s.win : 0;
+      const to = Math.min(s.n, s.win > 1 ? (k + 1) * s.win : s.n);
+      s.winK = k;
+      s.winBase = from;
+      s.winShots = to;
+      s.wLoaded = 0;
+      s.winT0 = nowMs();
+      log("exp6734D: WIN " + tagOf(s) + " k=" + (k + 1) + "/" + winCountOf(s) +
+          " SHOT " + from + ".." + (to - 1) + " t=" + s.winT0);
+      const urlPrefix = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_bit?c=" + s.cfg + "&id=BTD";
+      for (let i = from; i < to; i += 1) {
+        try {
+          s.panels[i].SetImage(urlPrefix + i + "&round=" + s.r);
+        } catch (e) { log("exp6734D: SetImage THREW " + expErr(e)); }
+      }
+      // 窗口停滞推进: 单 bit 永不到不拖死整帧(仅窗口模式;win=1 由轮超时管)
+      if (s.win > 1) {
+        const myR = s.r, myK = k;
+        try {
+          $.Schedule(6.0, function () {
+            const t = State.d;
+            if (!t || !t.active || t.r !== myR || t.winK !== myK) return;
+            log("exp6734D: WIN " + tagOf(t) + " k=" + (myK + 1) + "/" + winCountOf(t) +
+                " STALL loaded=" + t.wLoaded + "/" + (t.winShots - t.winBase));
+            dAdvance();
+          });
+        } catch (e) {}
+      }
+    };
+
+    const dAdvance = function () {
+      const s = State.d;
+      if (!s || !s.active) return;
+      if (s.winShots >= s.n) { dFinishRound(); return; }
+      dShotWindow(s.winK + 1);
+    };
+
+    const dFinishRound = function () {
+      const s = State.d;
+      if (!s || !s.active) return;
+      s.active = false;
+      const word = nowMs() - s.t0;
+      const lost = s.n - s.loaded;
+      const label = lost <= 0 ? "DONE" : "TIMEOUT";
+      log("exp6734D: ROUND " + tagOf(s) + " " + label + " loaded=" + s.loaded + "/" + s.n +
+          " word=" + word +
+          " first=" + (s.first === null ? -1 : s.first) + " last=" + (s.last === null ? -1 : s.last) +
+          " min=" + (s.min === null ? -1 : s.min) + " max=" + (s.max === null ? -1 : s.max) +
+          " lost=" + lost + " seqs=" + s.seq);
+      if (s.r >= s.rounds) {
+        log("exp6734D: CFG " + s.cfg + " DONE rounds=" + s.rounds + " idx=" + (s.ci + 1) + "/" + s.plan.length);
+        s.ci += 1;
+        if (s.ci >= s.plan.length) {
+          log("exp6734D: ALL DONE — 全部配置完成;取数: node scripts/exp6734d_analyze.js logs/bridge.log");
+          State.dRunning = false;
+          State.d = null;
+          return;
+        }
+        const nxt = s.plan[s.ci];
+        try { $.Schedule(3.0, function () { dSetupConfig(nxt); }); }
+        catch (e) { log("exp6734D: schedule THREW " + expErr(e)); State.dRunning = false; }
+        return;
+      }
+      // 有丢失时多等一会(超时残留加载未落定,防污染下一轮 dt)
+      const gap = lost <= 0 ? 0.5 : 3.0;
+      try { $.Schedule(gap, dStartRound); }
+      catch (e) { log("exp6734D: schedule THREW " + expErr(e)); State.dRunning = false; }
+    };
+
+    const dStartRound = function () {
+      const s = State.d;
+      if (!s) return;
+      s.r += 1;
+      s.active = true;
+      s.ids = {};
+      s.loaded = 0;
+      s.seq = 0;
+      s.first = null; s.last = null; s.min = null; s.max = null;
+      s.t0 = nowMs();
+      log("exp6734D: ROUND " + tagOf(s) + " SHOT t=" + s.t0);
+      dShotWindow(0);
+      const myR = s.r;
+      try {
+        $.Schedule(timeoutMsOf(s), function () {
+          const t = State.d;
+          if (!t || !t.active || t.r !== myR) return;
+          dFinishRound();
+        });
+      } catch (e) { log("exp6734D: timeout schedule THREW " + expErr(e)); }
+    };
+
+    const dSetupConfig = function (cfgObj) {
+      const s = State.d;
+      if (!s) return;
+      s.cfg = cfgObj.cfg + "@" + s.runTag;
+      s.n = cfgObj.n;
+      s.win = cfgObj.win;
+      s.rounds = cfgObj.rounds;
+      s.r = 0;
+      log("exp6734D: CFG " + s.cfg + " START n=" + s.n + " win=" + s.win +
+          " rounds=" + s.rounds + " idx=" + (s.ci + 1) + "/" + s.plan.length);
+      dStartRound();
+    };
+
+    dSetupConfig(plan[0]);
+  }
+
+  // ============= EXP6734-E: 多值符号判别(一个 Image 面板能否 >1 bit) =============
+  // 13 状态码 × 20 轮 × 1 面板/符号;面板唯一且每轮 URL 加 round 击穿缓存,同面板不重复 SetImage(6731 铁律)。
+  // 服务端:2xx→空PNG;3xx→302 跳 /rdata?f=E<code>(复用 6733 的游戏端 URL 文本上报);4xx/5xx→短 HTML。
+  // 预期三值判定: 200/201/204/206→LOADED(fast);301/302/304/307→LOADED(REDIR-LATE,~>800ms);
+  // 4xx/5xx→LOADED(HTML)或静默——无论哪种只要**与 2xx 行为可区分**即多值符号成立。
+  // 判读: node scripts/exp6734e_analyze.js logs/bridge.log
+  const EXP6734E_CODES = [200, 201, 204, 206, 301, 302, 304, 307, 400, 401, 403, 404, 500];
+
+  function runExp6734E() {
+    if (State.eRunning) { log("exp6734E: already running, ignore"); return; }
+    if (State.dRunning || State.bitRunning) { log("exp6734E: 6734-B/D running, refuse"); return; }
+
+    // 每符号 1 个面板(唯一 id,复用);URL 带 round=击穿缓存,永不覆盖同一面板
+    const panels = [];
+    for (let i = 0; i < EXP6734E_CODES.length; i += 1) {
+      const pid = "BTE" + i;
+      let p = null;
+      try { p = findChild(getRoot(), pid); } catch (e) {}
+      if (!isValid(p)) {
+        try { p = $.CreatePanel("Image", getRoot(), pid); } catch (e) {}
+        if (isValid(p)) { try { p.visible = false; p.style.width = "2px"; p.style.height = "2px"; } catch (e) {} }
+      }
+      if (!isValid(p)) { log("exp6734E: ABORT panel " + pid); return; }
+      panels.push(p);
+    }
+    const runTag = String(nowMs()).slice(-6);
+    const ROUNDS = 20, GAP = 2.0, TIMEOUT = 12.0;
+    log("exp6734E: START v" + VERSION + " run=" + runTag + " codes=" + EXP6734E_CODES.join("/") + " rounds=" + ROUNDS);
+    State.eRunning = true;
+    const st = { runTag: runTag, r: 0, active: false, t0: 0, seen: {} };
+    State.e = st;
+
+    if (!State.eHandlerOn) {
+      State.eHandlerOn = true;
+      try {
+        $.RegisterForUnhandledEvent("ImageLoaded", function (panel) {
+          let pid = "";
+          try { pid = panel ? String(panel.id) : ""; } catch (e) {}
+          if (pid.slice(0, 3) !== "BTE") return;
+          const s = State.e;
+          if (!s || !s.active) return;
+          const idx = parseInt(pid.slice(3), 10);
+          if (isNaN(idx) || idx >= EXP6734E_CODES.length) return;
+          const code = EXP6734E_CODES[idx];
+          if (s.seen[code]) { log("exp6734E: DUP n=" + s.runTag + " r=" + s.r + " code=" + code); return; }
+          s.seen[code] = 1;
+          const dt = nowMs() - s.t0;
+          const speed = dt < 800 ? "FAST" : "LATE";
+          log("exp6734E: LOADED n=" + s.runTag + " r=" + s.r + " code=" + code + " dt=" + dt + " " + speed);
+        });
+      } catch (e) { log("exp6734E: handler THREW " + expErr(e)); }
+    }
+
+    const eFinishRound = function () {
+      const s = State.e;
+      if (!s || !s.active) return;
+      s.active = false;
+      const missed = [];
+      for (let i = 0; i < EXP6734E_CODES.length; i += 1) {
+        if (!s.seen[EXP6734E_CODES[i]]) missed.push(EXP6734E_CODES[i]);
+      }
+      log("exp6734E: ROUND n=" + s.runTag + " r=" + s.r + " END loaded=" + (EXP6734E_CODES.length - missed.length) +
+          "/13 missed=" + (missed.length ? missed.join("/") : "-"));
+      if (s.r >= ROUNDS) {
+        log("exp6734E: ALL DONE — 取数: node scripts/exp6734e_analyze.js logs/bridge.log");
+        State.eRunning = false;
+        State.e = null;
+        return;
+      }
+      try { $.Schedule(GAP, eStartRound); } catch (e) { log("exp6734E: schedule THREW " + expErr(e)); State.eRunning = false; }
+    };
+
+    const eStartRound = function () {
+      const s = State.e;
+      if (!s) return;
+      s.r += 1;
+      s.active = true;
+      s.seen = {};
+      s.t0 = nowMs();
+      log("exp6734E: ROUND n=" + s.runTag + " r=" + s.r + " SHOT t=" + s.t0);
+      const urlPrefix = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/probe_e?id=BTE";
+      for (let i = 0; i < EXP6734E_CODES.length; i += 1) {
+        try {
+          panels[i].SetImage(urlPrefix + i + "&round=" + s.r + "&code=" + EXP6734E_CODES[i] + "&t=" + s.runTag);
+        } catch (e) { log("exp6734E: SetImage THREW " + expErr(e)); }
+      }
+      const myR = s.r;
+      try {
+        $.Schedule(TIMEOUT, function () {
+          const t = State.e;
+          if (!t || !t.active || t.r !== myR) return;
+          eFinishRound();
+        });
+      } catch (e) { log("exp6734E: timeout schedule THREW " + expErr(e)); }
+    };
+
+    eStartRound();
+  }
+
   function boot() {
     State.cfg = loadUiConfig();
     applyUILang(); // 初始化界面语言
@@ -3994,6 +6547,7 @@ function injectTranslation(row, sig, text, fragment) {
     syncBridgeConfig(); // BUGFIX 0.1.3:启动即同步桥配置,发送前翻译不再需要先开一次设置面板
     applyUILang(); // 初始化界面语言(配置同步后应用)
     updateBridgeDot(); // 初始状态:桥未上线前显示红点
+    // EXP6734-B/C/D/E: 手动触发(进对局后聊天输入 /bt6734b | /bt6734c | /bt6734d | /bt6734e);6734-A 已采完不自动跑
     // DMM 用户引导:启动后 12s 桥仍未在线 => 面板显示未运行 + 安装指引
     $.Schedule(12.0, checkBridgeMissing);
     $.Schedule(SLOW_POLL_SECONDS, scanChatMessages);

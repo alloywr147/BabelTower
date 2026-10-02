@@ -17,6 +17,23 @@
   hittestchildren: false;
 }
 
+/* EXP-6726b:引擎疑似不为不可见/非激活面板加载网页;导航前由 JS 切到此类,
+   2x2 像素放在左上角屏幕外,肉眼不可见但面板处于"可见"状态 */
+.LCTBridgePanelActive {
+  width: 2px;
+  height: 2px;
+  opacity: 1;
+  horizontal-align: left;
+  vertical-align: top;
+  margin-left: -200px;
+  margin-top: -200px;
+  z-index: -1;
+  hittest: false;
+  hittestchildren: false;
+  background-color: #000000;
+  brightness: 0.0;
+}
+
 /* ---- 设置按钮(输入框右侧的"译") ---- */
 .LCTSettingsButton {
   background-color: rgba(18, 22, 32, 0.85);

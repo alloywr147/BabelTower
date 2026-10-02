@@ -378,3 +378,64 @@ btipc6736: ALL DONE n=20 ok=20 fail=0
 **结论**:`REQ_TIMEOUT=30s` 维持不变,**暂不加 response 长度限制**。触发条件与兜底路径已存在(超 44 帧/440B 才会逼近死线,桥侧超时由 §13 既有 `kind:'timeout'` 降级路径接住),留待真实游戏聊天出现超长译文再按数据复议;帧长 10B 是协议 §B 冻结位段,改它 = 改协议,不为假想需求动冻结面。
 
 **观察项(非阻塞)**:两条长输入均被截在恰好 **72 字符**(`walker b` / `going t` 处断),截断发生在 `/bt6737` 处理器上游(客户端 handler 只有 `text.slice(0,60)` 用于打日志,mod 内无 72 上限)→ 疑为游戏聊天输入框自身的 TextEntry 上限,待单独确认;若确认,则线上真实输入 ≤72 字符,译文帧数天然 ≤ ~10 帧,死线更宽松。
+
+## 14. 步骤⑥-整合:出站翻译接 BTIPC(2026-10-02)
+
+按规格 §13.3 第 6 步「接入 `lingua_chat.js`(/tr 链)」,把**发送前翻译(outgoing)**接上 BTIPC。客户端 `VERSION=1.0.7-6726-btipc03`。
+
+**范围**:仅出站;入站聊天翻译(kind `chat`)与 config/log/health 桥任务**继续走旧通道**(直连/HTML 面板)——入站对时延更敏感(实车 BTIPC ≈1.2s 首拍 + 650ms/帧),且旧通道入站在线上可用;迁移入站 = `dispatchJob` 里一行扩展,留待有数据再做。
+
+### 信封契约(上层约定;行/帧/窗口协议零改动)
+
+- TRQ payload 首行 `t=<target>[;tm=<ms>]` + `\n` + 原文;target 字符集 `[A-Za-z0-9-]`、1..16 位;
+- **target 必须随请求走**:桥 config `defaults.targetLanguage` 是入站目标(zh-Hans),出站 `outgoingTarget` 默认 en,不带就会译反方向;
+- `tm = OUTGOING_TIMEOUT_MS - 4000 = 16000`:桥端 provider 死线小于游戏侧 20s 死线,桥先给结论(成功帧或空 END 帧),客户端才收得到;
+- **无信封(裸文本)→ 桥回退 config 默认**:`/bt6737` 冒烟、E2E 老用例逐字节兼容;
+- 解析器:`core/btipc/transport.js` `parseTrqEnvelope`(桥端唯一实现源);游戏侧**只拼接不解析**(纯字符串,零反斜杠正则,规避 resourcecompiler 转义 bug);不安全目标语言(自定义语言含空格/Unicode)→ 游戏侧直接回落旧通道,不让桥猜方向。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `core/btipc/transport.js` | `parseTrqEnvelope` + 导出(§14.1 校验路径不变,信封对传输层是不透明字节) |
+| `core/bridge_server.js` | `onBtipcTranslateReq` 吃信封 → `runTranslate({text, targetLanguage, timeoutMs})`;**缓存/词典键 `tl` 改用生效 target**(原先写死 `cfg.defaults.targetLanguage`,与 `/api/v1/translate` 缓存键不一致会撞错方向) |
+| `lingua_chat.js` | ① 新增 `outgoingViaBtipc(job)`;② `dispatchJob` 排队 15s 时限上移到通道选择前(结论不变)+ 出站先试 BTIPC;③ `translateOutgoing` 出口门:BTIPC 可用时不因面板/直连双死而拦;④ VERSION bump |
+| `scripts/btipc_trq_e2e.js` | 加 `env-en`(`t=en\n你好` → 应出英文)与 `env-zh`(`t=zh-Hans\nthank you…` → 应出中文)定向用例 |
+| `tests/btipc/translate.test.js` | 信封 6 例(拆解 / 裸文本兼容 / 字符集收紧 / 空原文 / 行级往返过 §14.1 / J1 预算)→ **16/16** |
+
+### 失败语义(`outgoingViaBtipc` 结算矩阵,对齐旧通道 + spec §8)
+
+| 情形 | 行为 |
+|---|---|
+| busy(探针在途)/ too_long(>680B)/ 目标语言不安全 | 返 false → **回落旧通道**(直连/HTML 面板),行为与整合前一致 |
+| 成功(译文帧) | `handleBridgePayload({ok:true, translation})` → 占位还原 → 发送 |
+| `translate_error`(桥收到请求但翻译失败,空 END 帧) | 走既有响应型失败语义:**attempts 重试 ≤1 次**,再败按原文 |
+| `timeout / crc_dead / bridge_down`(传输型失败) | spec §8:**按原文发送** + `outgoing btipc: FAIL kind=…` 日志,不重试(旧通道同样不可达时重试只会白等 20s) |
+| 队列死线 | BTIPC 内部 20s 死线 + **22s deadman** 兜底强制结算(迟到回调由 `settled/_timedOut` 拦截),单槽队列永不卡死 |
+| 排队 >15s | 上移到 `dispatchJob` 顶部的既有检查,发原文(先于 BTIPC,避免已等 15s 再起 20s 传输) |
+
+### 决策记录:too_long 回落旧通道(对 spec §8 的有据偏离)
+
+§8 原文「>680B → 按原文发送」写定于旧通道不可用时期;现旧通道可用,**回落能译则译,严格优于发原文**,且 J1 行预算不受影响(信封按字节计入 680B 上限,超限即回落,行长最坏不变)。若 72 字符 TextEntry 上限坐实(§13 观察项),680B 不可达,此分支纯防御。
+
+### 时序预算
+
+出站典型 = 1.2s 首拍 + 翻译 0.1~6s(BUSY 轮 ~1.1s/轮)+ 650ms/帧 → 60B 译文约 5~8s,20s 死线内;provider 16s 死线 + 空 END 帧回传 ≤1.5s < 20s 客户端死线。
+
+### 测试
+
+- `tests/btipc/` **23/0**(translate 10→16);全量仅剩 quickchat_match 16 红(既有,待实车样本),其余全绿;`client_copy_sync` 29/0(改动全在 @sync 块外)。
+
+### 部署
+
+- VPK 槽位铁律:备份 `pak15_dir.vpk.bak-pre-btipc03-…` 后安装;
+- 桥重启加载新 `bridge_server/transport`;语料指纹 bd57c0e6 三方对账应保持 ALL MATCH。
+
+### 待实车验收(设置里发送前翻译 outgoing ≠ off)
+
+1. 发一条中文 → `logs/bridge.log` 应见链:`[LCT] BTIPC TRQ … b64=…`(游戏)→ `BTIPC TRQ w=… target=en text=… (BUSY until translated)`(桥)→ 若干 `BTIPC: r=… seq=… OK|END` → `outgoing btipc: ok win=… dt=…ms`,状态条「已发送译文: …」;
+2. 切换出站目标语言(如自定义)→ 桥日志 `target=` 跟随;
+3. 回归:`/bt6737 hello`(裸文本兼容)、`/bt6736 20`(回声不受影响);
+4. 桥停机发消息 → `outgoing btipc: FAIL kind=timeout … -> send original` + 「翻译不可用,已按原文发送」,≤22s 必有结论。
+
+**回滚**:客户端回装上一份 VPK 备份;桥 `git checkout core/bridge_server.js core/btipc/transport.js && powershell -ExecutionPolicy Bypass -File scripts/restart_bridge.ps1`。

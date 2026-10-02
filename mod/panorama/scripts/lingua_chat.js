@@ -15,7 +15,7 @@
   "use strict";
 
   const LOG_PREFIX = "[LCT]";
-  const VERSION = "1.0.7-6726-btipc01"; // BTIPC v1 回声客户端(聊天命令 /bt6736;规格 docs/btipc-v1.md);前版 1.0.7-6726-exp6734E
+  const VERSION = "1.0.7-6726-btipc05"; // BTIPC v1 + ⑥上层整合:出站 TRQ + 入站 chat + 保存/测试/读配置 op(btipc05)+ BTIPC 健应回声(6726 后旧通道 SetURL 导航全灭 DIAG-6726,nav 只作 >45s 无成功时的判红兜底);另修 collectPanelConfig TDZ;前版 btipc04
 
   // ---- 原版聊天结构 ID(当前 Deadlock 版本稳定)----
   const CHAT_ROOT_ID = "Chat";
@@ -1255,8 +1255,11 @@
       const text = safeText(textLabel) || collectText(row);
       if (!text) return null;
       const isOwn = hasClass(row, "IsSelf") || !!findClass(row, LOCAL_CLIENT_ID);
+      // HUD 顶栏轮盘行的结构标记是 PingStyleIcon(+SubjectIcon/CooldownTimer/ResponseHeroes),
+      // 不带 Ping class/PingLabel(2026-10-02 exp6738 实车 dump 实锤)——
+      // 漏掉它会让 HUD 侧快捷语音 100% 退化为模板匹配,游戏改名即翻车(26 红的病因面)
       const result = { sender: UNKNOWN_NAME, channel: "hud", text: text, isOwn: isOwn, hud: true,
-        quick: hasClass(row, "Ping") || !!findChild(row, "PingLabel") };
+        quick: hasClass(row, "Ping") || !!findChild(row, "PingLabel") || !!findChild(row, "PingStyleIcon") };
       return result;
     }
     const source = findChild(row, MESSAGE_SOURCE_ID);
@@ -2279,7 +2282,185 @@ function injectTranslation(row, sig, text, fragment) {
     }
   }
 
+  // ===== ⑥ 上层整合:出站翻译走 BTIPC(规格 docs/btipc-v1.md §7/§8;checklist §14)=====
+  // btipc04 扩展:入站 chat 同路复用 —— chat 发裸文本(桥回退出站外的默认 target=zh-Hans),
+  // 出站发信封。函数名保留 outgoing(调用方/日志前缀按 kind 区分:outgoing btipc / chat btipc)。
+  // 信封(上层约定,行/帧/窗口协议零改动):payload 首行 "t=<target>;tm=<ms>" + "\n" + 原文。
+  // 目标语言必须随请求走:桥 config 的 defaults.targetLanguage 是入站目标(zh-Hans),
+  // 出站 outgoingTarget 默认 en,不带就会译反方向。
+  // 返回 true = 本 job 由 BTIPC 接管(结算在回调内闭环);false = 回落旧通道(直连/HTML 面板)。
+  // 失败语义对齐旧通道(spec §8 + 既有 attempts 策略):响应型失败(桥收到请求但翻译失败,
+  // 空 END 帧 → translate_error)走 handleBridgePayload 重试 ≤1 次;传输型失败
+  // (timeout/crc_dead/bridge_down)按原文发送不重试;busy/too_long/目标语言不安全 → 回落旧通道。
+  function outgoingViaBtipc(job) {
+    let tag = "btipc";
+    try {
+      if (!BTIPC) return false;
+      const text = String((job.record && job.record.text) || "");
+      // btipc04:入站 chat 也走 BTIPC —— 裸文本(不带信封)→ 桥回退 config 默认
+      // target(入站 zh-Hans),不依赖游戏侧从 9/30 起就同步不到的 State.cfg;
+      // 出站仍带 t= 信封(target 必须随请求走,否则桥按默认译反方向)。
+      const isChat = job.kind === "chat";
+      // btipc05:设置面板「保存/测试」+ 开机读配置(op=config/test)同路迁移 ——
+      // 旧通道 6726 后必死,这三个操作是用户唯一能直接感知的「面板坏了」。
+      const isOp = job.kind === "bridge" && (job.op === "config" || job.op === "test");
+      tag = isOp ? job.op + " btipc" : (isChat ? "chat btipc" : "outgoing btipc");
+      if (BTIPC.busy()) {
+        // 旧通道 6726 后已死,忙时不立刻回落:短等重投(≤6 次 ×0.5s / 12s 死线;
+        // btipcFinish 的 deadman 必清忙态)。释放槽位但不同步重泵(finishJob 会同步
+        // pumpQueue → 原地自旋把次数打满,必须走 $.Schedule 延迟泵)。等不动才回落。
+        if (!job._btipcSince) job._btipcSince = nowMs();
+        const since = job.enqueuedAt || job._btipcSince;
+        const waited = job._btipcWaits || 0;
+        if (waited < 6 && nowMs() - since < 12000) {
+          job._btipcWaits = waited + 1;
+          State.queue.unshift(job);
+          State.activeRequests = Math.max(0, State.activeRequests - 1);
+          $.Schedule(0.5, pumpQueue);
+          log(tag + ": busy, requeue wait #" + (waited + 1));
+          return true;
+        }
+        return false;
+      }
+      let payload;
+      let timeoutMs;
+      if (isOp) {
+        // 载荷 = 旧通道同款 JSON(decode job.data);test 带 tm 让桥端 provider 死线先到,
+        // config 瞬时完成不带。桥端响应恒为 JSON → .then 解析后走 handleBridgePayload
+        // 的 bridge 分支(与旧通道逐字段同形:ok/config/translation/error)。
+        const raw = decodeURIComponent(String(job.data || "{}"));
+        if (job.op === "test") {
+          payload = "op=test;tm=" + Math.max(4000, (State.cfg.timeoutMs || 15000) - 4000) + "\n" + raw;
+          timeoutMs = Math.max(State.cfg.timeoutMs || 15000, 15000);
+        } else {
+          payload = "op=config\n" + raw;
+          timeoutMs = 8000;
+        }
+      } else if (isChat) {
+        payload = text;
+        timeoutMs = State.cfg.timeoutMs || 15000;
+      } else {
+        const target = resolveOutgoingTarget();
+        // 信封要求目标语言为安全字符集([A-Za-z0-9-],1..16):自定义目标语言含其它字符时
+        // 回落旧通道(URL 编码无此限制),不让桥端信封解析失败回退成错误方向。
+        const SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
+        let safe = target.length >= 1 && target.length <= 16;
+        for (let i = 0; safe && i < target.length; i += 1) {
+          if (SAFE.indexOf(target.charAt(i)) < 0) safe = false;
+        }
+        if (!safe) {
+          log(tag + ": target unsafe (" + String(target).slice(0, 20) + "), fallback old transport");
+          return false;
+        }
+        // tm = 桥端 provider 死线,比游戏侧 20s 死线小 4s:桥先给结论(成功帧或空 END 帧),
+        // 客户端才收得到,而不是双方同时放弃。
+        payload = "t=" + target + ";tm=" + (OUTGOING_TIMEOUT_MS - 4000) + "\n" + text;
+        timeoutMs = OUTGOING_TIMEOUT_MS;
+      }
+      const payloadLen = btipcUtf8Bytes(payload).length;
+      if (payloadLen > BTIPC_REQ_MAX_PAYLOAD) {
+        // spec §8 too_long 本该按原文发送;旧通道无 680B 上限 → 回落更优,且 J1 行预算不破
+        log(tag + ": too_long " + payloadLen + "B, fallback old transport");
+        return false;
+      }
+      let settled = false;
+      // op 任务失败必须交 {ok:false,error}(旧通道语义,状态栏能显示具体错误);
+      // chat/outgoing 仍 done(null,null) → 发原文/显示原行。
+      const doneFail = function (errCode) {
+        if (isOp) { try { job.done({ ok: false, error: errCode }); } catch (e) {} }
+        else { try { job.done(null, null); } catch (e) {} }
+      };
+      const settleOriginal = function (why, errCode) {
+        if (settled || job._timedOut) return;
+        settled = true;
+        log(tag + ": " + why);
+        doneFail(errCode || "btipc_fail");
+        finishJob();
+      };
+      const win = BTIPC.newWindowId();
+      const t0 = nowMs();
+      BTIPC.request({ windowId: win, text: payload, translate: true, timeoutMs: timeoutMs })
+        .then(function (got) {
+          if (settled || job._timedOut) return;
+          settled = true;
+          try {
+            if (isOp) {
+              let res = null;
+              try { res = JSON.parse(String(got == null ? "" : got)); } catch (e2) { res = null; }
+              if (!res || typeof res.ok !== "boolean") res = { ok: false, error: "bad_op_response" };
+              log(tag + ": ok win=" + win + " dt=" + (nowMs() - t0) + "ms ok=" + res.ok);
+              handleBridgePayload(job, res);
+            } else {
+              log(tag + ": ok win=" + win + " dt=" + (nowMs() - t0) + "ms out=" + String(got).length + "ch");
+              handleBridgePayload(job, { ok: true, translation: got, detectedLanguage: null });
+            }
+          } catch (e) {
+            log(tag + ": settle THREW " + expErr(e));
+            doneFail("settle_threw");
+            finishJob();
+          }
+        })
+        .catch(function (err) {
+          if (settled || job._timedOut) return;
+          const kind = (err && err.kind) || "unknown";
+          if (kind === "translate_error") {
+            // 响应型失败 → 走旧的响应型失败语义(attempts ≤1 重试,内部含 requeue/finishJob)
+            settled = true;
+            try {
+              handleBridgePayload(job, { ok: false, error: "btipc_translate_error" });
+            } catch (e) {
+              settled = false;
+              settleOriginal("retry enqueue THREW " + expErr(e));
+            }
+            return;
+          }
+          settleOriginal("FAIL kind=" + kind + " msg=" + ((err && err.message) || "") +
+              " dt=" + (nowMs() - t0) + "ms -> " + (isOp ? "respond error" : "send original"), kind);
+        });
+      // 队列活性死线:BTIPC 自身 20s 死线 +2s 兜底。BTIPC 若因引擎异常永不确定,
+      // 这里强制结算(settled/_timedOut 置位后,迟到的 then/catch 直接忽略)。
+      try {
+        $.Schedule((timeoutMs + 2000) / 1000, function () {
+          if (settled || job._timedOut) return;
+          settled = true;
+          job._timedOut = true;
+          log(tag + ": deadman fired (win=" + win + "), " + (isOp ? "respond timeout" : "send original"));
+          doneFail("timeout");
+          finishJob();
+        });
+      } catch (e) {}
+      return true;
+    } catch (e) {
+      // 连 request 都没发出去:绝不让异常卡住单槽队列。
+      // (catch 在 try 块外,isOp/doneFail 不可见 —— 就地判定,语义与 doneFail 一致)
+      log(tag + ": dispatch THREW " + expErr(e));
+      if (job.kind === "bridge" && (job.op === "config" || job.op === "test")) {
+        try { job.done({ ok: false, error: "dispatch_threw" }); } catch (e2) {}
+      } else {
+        try { job.done(null, null); } catch (e2) {}
+      }
+      finishJob();
+      return true;
+    }
+  }
+
   function dispatchJob(job) {
+    // 出站翻译排队超过 15s 未轮到(队列被其他请求占满)直接发原文,避免输入卡死。
+    // (提到通道选择之前,结论不变:旧通道不可用时同样 done(null,null) 发原文,只多一行日志)
+    if (job.kind === "outgoing" && job.enqueuedAt && nowMs() - job.enqueuedAt > 15000) {
+      job.done(null, null);
+      finishJob();
+      log("outgoing dropped: queued too long, sending original");
+      return;
+    }
+    // ⑥ 上层整合:出站翻译 + 入站 chat(btipc04)+ 保存/测试/读配置 op(btipc05)
+    // 优先走 BTIPC;接不了(too_long/目标语言不安全/久等仍未空)回落旧通道
+    // (6726 后已死 → 翻译兜底原文,op 兜底 {ok:false,error})
+    const viaBtipc =
+      job.kind === "outgoing" || job.kind === "chat" ||
+      (job.kind === "bridge" && (job.op === "config" || job.op === "test"));
+    if (viaBtipc && outgoingViaBtipc(job)) return;
+
     const canHttp = detectAsyncWebRequest();
     const panel = canHttp ? null : ensurePanel();
     if (!panel && !canHttp) {
@@ -2296,13 +2477,6 @@ function injectTranslation(row, sig, text, fragment) {
       return;
     }
     ensureBridgeEvents();
-    // 出站翻译排队超过 15s 未轮到(队列被其他请求占满)直接发原文,避免输入卡死
-    if (job.kind === "outgoing" && job.enqueuedAt && nowMs() - job.enqueuedAt > 15000) {
-      job.done(null, null);
-      finishJob();
-      log("outgoing dropped: queued too long, sending original");
-      return;
-    }
     // 出站翻译超时计时从此刻(开始处理)算起;排队等待不计入
     if (job.kind === "outgoing") {
       let scheduled = false;
@@ -2987,6 +3161,23 @@ function injectTranslation(row, sig, text, fragment) {
   // 注意:health 与翻译共用串行队列;队列忙时跳过本次 ping,避免 health 阻塞发消息/测试
     function healthCheck() {
     if (State.queue.length > 0 || State.pending) return;
+    // btipc04:BTIPC 健康新鲜期(45s 内有成功)用 REQ 回声(15s/次)替代必死的 nav health;
+    // 6726(DIAG-6726)后 SetURL 导航全灭 —— nav 只在 BTIPC 也哑掉(>45s 无成功)时兜底判红,
+    // 否则每 5s 打一次必死的 nav 只会刷屏 + 堵串行队列。回声走 REQ(translate=false),桥端现成。
+    if (BTIPC) {
+      const nowH = nowMs();
+      const freshH = State.btipcLastOk && nowH - State.btipcLastOk <= 45000;
+      if (!BTIPC.busy()) {
+        const echoDue = !State.btipcLastEcho || nowH - State.btipcLastEcho >= 15000;
+        if (echoDue) {
+          State.btipcLastEcho = nowH;
+          BTIPC.request({ windowId: BTIPC.newWindowId(), text: "health", translate: false, timeoutMs: 8000 })
+            .catch(function (err) { log("btipc health echo FAIL kind=" + ((err && err.kind) || "unknown")); });
+          return;
+        }
+      }
+      if (freshH) return; // 新鲜期(含忙时)不打必死的 nav
+    }
     // long offline + panel-only channel -> reset to re-probe direct (works if game supports AsyncWebRequest)
     if (State.bridgeOfflineSince && (nowMs() - State.bridgeOfflineSince) > BRIDGE_OFFLINE_GRACE_SECONDS * 1000 && State.canHttp === false) {
       State.canHttp = null;
@@ -3344,9 +3535,43 @@ function injectTranslation(row, sig, text, fragment) {
     return touched;
   }
 
+  // ================= 常驻轻量打字指示器观察(exp6738 结论,被动采集)=================
+  // 9/30 更新:打字/发送中 = 聊天行 MessageContents 内的 TypingAnim(TypingDot1~3),
+  // 快捷语音不产生此行。已知 id 直查(不扫全树),只在状态翻转时打一行 ——
+  // 任何人任何时候打字(大厅/对局)都会自然留证,与消息行日志按时间戳对账,
+  // 不需要专门找"真人打字的对局"。已证实自己的打字 3 周期全中;待采:他人打字样本(广播侧)。
+  function watchTypingIndicator() {
+    const root = getRoot();
+    if (!root) return;
+    let where = "";
+    try {
+      if (findChild(resolveChatMessages(), "TypingAnim")) where = "chat";
+      if (!where) {
+        resolveHudMessages();
+        for (let i = 0; i < State.hudMessages.length; i += 1) {
+          if (findChild(State.hudMessages[i], "TypingAnim")) { where = "hud" + i; break; }
+        }
+      }
+      if (!where && findChild(resolveLobbyMessages(), "TypingAnim")) where = "lobby";
+    } catch (e) {}
+    const O = State.typingLog || (State.typingLog = { on: false, t0: 0, where: "" });
+    const on = !!where;
+    if (on === O.on) return;
+    const now = nowMs();
+    O.on = on;
+    if (on) {
+      O.t0 = now;
+      O.where = where;
+      log("typing: ON " + where);
+    } else {
+      log("typing: OFF " + O.where + " life=" + (now - O.t0) + "ms");
+    }
+  }
+
   function scanChatMessages() {
     // 注意:两个扫描都必须执行,不能用 || 短路——
     // 左下角聊天有活动时 scanChatMessagesOnce() 返回 true 会跳过 HUD 扫描
+    try { watchTypingIndicator(); } catch (e) {}
     const touchedChat = scanChatMessagesOnce();
     const touchedHud = scanHudTopBarOnce();
     const touchedLobby = scanLobbyOnce();
@@ -3711,7 +3936,17 @@ function injectTranslation(row, sig, text, fragment) {
     if (State.btipcActive !== st) return;
     State.btipcActive = null;
     st.roundOpen = false;
-    if (ok) { try { st.resolve(value); } catch (e) { log("btipc: resolve THREW " + expErr(e)); } }
+    if (ok) {
+      // btipc04:任何 BTIPC 成功(翻译/健应回声)= 桥在线实证 → 状态栏置绿
+      // (6726 后 nav health 永远失败,老逻辑只会显示未连通)。
+      State.btipcLastOk = nowMs();
+      State.bridgeOfflineSince = 0;
+      if (!State.bridgeUp) {
+        markBridgeUp();
+        try { setBridgeStatus(t("bridgeOnline") + " \u00b7 " + (State.cfg.provider || "bing")); } catch (e) {}
+      }
+      try { st.resolve(value); } catch (e) { log("btipc: resolve THREW " + expErr(e)); }
+    }
     else { try { st.reject(value); } catch (e) { log("btipc: reject THREW " + expErr(e)); } }
   }
 
@@ -3920,6 +4155,15 @@ function injectTranslation(row, sig, text, fragment) {
       return;
     }
 
+    // /bt6738 [stop]: 三点「正在发送」广播指示器 + 聊天行结构取证(9/30 机制),不发送
+    //   无参 = toggle;stop = 明确停止。日志前缀 exp6738:
+    if (trimmed === "/bt6738" || trimmed.indexOf("/bt6738 ") === 0) {
+      const p6738Arg = trimmed.slice(7).trim();
+      clearInput();
+      runExp6738(p6738Arg);
+      return;
+    }
+
     if (trimmed === "!lcttest" || trimmed.indexOf("!lcttest ") === 0) {
       const testText = trimmed.length > 9 ? trimmed.slice(9).trim() : "hello can you push mid";
       injectHudTestMessage(testText);
@@ -3999,10 +4243,12 @@ function injectTranslation(row, sig, text, fragment) {
 
   function translateOutgoing(text, done) {
     // 直连通道(canHttp)可用时不需要 HTML 面板;即便面板不可用也应走直连翻译。
-    // 仅当直连不可用且面板也不可用时,才按原文发送。
+    // ⑥ 上层整合:BTIPC 可用时同样不依赖面板/直连(自建 Image 面板 + console.log 出站)。
+    // 仅当两条旧通道都不可用且 BTIPC 也接不了(探针占线)时,才按原文发送。
     const canHttp = detectAsyncWebRequest();
     const panel = canHttp ? null : ensurePanel();
-    if (!canHttp && !panel) {
+    const btipcReady = !!BTIPC && !BTIPC.busy();
+    if (!canHttp && !panel && !btipcReady) {
       setStatus("桥未连接,已按原文发送");
       done(null, null);
       return;
@@ -4426,11 +4672,6 @@ function injectTranslation(row, sig, text, fragment) {
     const apiKeyField = fieldValue("LCTApiKey");
     // 面板字段为空但该服务商已有 Key:发保留标记,避免误清空(修复 /tr 重复打开后 Key 丢失)
     const apiKeyValue = (!apiKeyField && (State.cfg._providerKeys || {})[prov]) ? "********" : apiKeyField;
-    // 仅当用户真的改动了回退列表输入时才回传;未动过/异步回填前 = 不带该字段,桥端保留原值
-    const fbField = String(fieldValue("LCTFallback") || "");
-    if (fbField !== credFieldSnap.fallback) {
-      out.fallbackProviders = fbField.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
-    }
     // region 只有在用户真的改动了输入时才回传(对比快照);
     // 清空输入 = 显式请求清除(clearRegion),未动过 = 完全不带该字段,桥端保留原值
     const regionField = fieldValue("LCTRegion");
@@ -4461,6 +4702,13 @@ function injectTranslation(row, sig, text, fragment) {
         timeoutMs: Number(fieldValue("LCTTimeout")) || 15000,
       },
     };
+    // 仅当用户真的改动了回退列表输入时才回传;未动过/异步回填前 = 不带该字段,桥端保留原值。
+    // (btipc05 bugfix:此块曾位于 const out 声明之前 —— 一旦改过回退列表就触发 TDZ
+    //  ReferenceError,collectPanelConfig 抛死,保存按钮静默无反应。)
+    const fbField = String(fieldValue("LCTFallback") || "");
+    if (fbField !== credFieldSnap.fallback) {
+      out.fallbackProviders = fbField.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+    }
     // 仅当用户真的改动了区域输入时才回传;清空输入 = 显式清除
     if (regionField !== credFieldSnap.region) {
       if (regionField === "") out.clearRegion = true;
@@ -6573,6 +6821,264 @@ function injectTranslation(row, sig, text, fragment) {
       } catch (e) {}
       $.Schedule(15.0, diagLoop);
     });
+  }
+
+  // ============= EXP6738: 三点「正在发送」广播指示器 + 聊天行结构取证 =============
+  // 背景:9/30 更新后,普通聊天按回车 → 广播给所有人一个「...」三点对话框;快捷语音不走这条路径。
+  // 目标:① 抓三点面板的 type/id/class/父链/可见性/尺寸/存活时长(C++ 动态创建,静态资源里查不到)
+  //       ② 抓每条新聊天行的 class 列表 + 子树结构 + 本方 quick 判定(看游戏是否给轮盘消息留了类型标记)
+  //       ③ 行到达时三点窗口是否活跃(相关性)→ 判定该信号能否当 quickchat_match 第二判据
+  // 触发:聊天输入 /bt6738(toggle;/bt6738 stop 明确停);日志前缀 exp6738:
+  // 回收:$.Msg → 游戏 console.log → 桥 tail → logs/bridge.log 的 [game] 行
+  const P6738_POLL = 0.12;      // 120ms 轮询(三点存活 = 回车到服务器回显,通常 ≥200ms,120ms 足够不漏沿)
+  const P6738_MAX_NODES = 6000; // 全树扫描节点上限(HUD 树防炸)
+  const P6738_MAX_CAND = 80;    // CAND 日志上限(弱命中可能扫到静态面板,防刷屏;计数不截)
+  const P6738_MAX_ROWS = 60;    // 行结构 dump 上限
+  // 注意:本正则刻意零反斜杠(LEARNINGS 2026-08-31:resourcecompiler 对 JS 正则反斜杠转义有 bug)
+  const P6738_TEXT_RE = /^[.…·•・․]{1,8}$/;                                // "..." "…" "・・・" 等点状文本
+  const P6738_ANCHOR_RE = /typ|dots|indicator|queue|deliver|sending|chatstatus|messagestatus|pend/i; // id/class/src 锚定
+
+  function runExp6738(arg) {
+    const S = State.p6738 || (State.p6738 = { active: false });
+    if (arg === "stop") {
+      if (!S.active) { log("exp6738: not running"); return; }
+      S.active = false;
+      log("exp6738: STOP ticks=" + S.ticks + " cands=" + S.seq + " rows=" + S.rowsLogged);
+      return;
+    }
+    if (S.active) {
+      if (arg === "start") { log("exp6738: already running"); return; }
+      S.active = false;
+      log("exp6738: STOP ticks=" + S.ticks + " cands=" + S.seq + " rows=" + S.rowsLogged);
+      return;
+    }
+    S.active = true;
+    S.t0 = nowMs();
+    S.ticks = 0;
+    S.seq = 0;
+    S.rowsLogged = 0;
+    S.candCap = false;
+    S.rowCap = false;
+    S.cands = {};  // sig -> {seq, first, last, open, hit}
+    S.rows = {};   // 容器 key -> 上次行数(基线,防把历史行当新行 dump)
+    S.dotsOn = false;
+    S.lastOn = 0;
+    S.lastOff = 0;
+    p6738Baseline(S);
+    log("exp6738: START poll=" + P6738_POLL + "s; 动作:① 自己打字回车 ② 自己发快捷语音 ③ 等别人打字(关键:广播归因); 完了 /bt6738");
+    try { $.Schedule(P6738_POLL, p6738Tick); } catch (e) { log("exp6738: schedule THREW " + expErr(e)); }
+  }
+
+  function p6738Containers() {
+    const out = [];
+    try { const m = resolveChatMessages(); if (m) out.push({ k: "chat", p: m }); } catch (e) {}
+    try { const l = resolveLobbyMessages(); if (l) out.push({ k: "lobby", p: l }); } catch (e) {}
+    try {
+      resolveHudMessages();
+      for (let i = 0; i < State.hudMessages.length; i += 1) out.push({ k: "hud" + i, p: State.hudMessages[i] });
+    } catch (e) {}
+    return out;
+  }
+
+  function p6738Baseline(S) {
+    const conts = p6738Containers();
+    for (let i = 0; i < conts.length; i += 1) {
+      if (!isValid(conts[i].p)) continue;
+      S.rows[conts[i].k] = childCount(conts[i].p);
+    }
+  }
+
+  function p6738Tick() {
+    const S = State.p6738;
+    if (!S || !S.active) return;
+    S.ticks += 1;
+    try { p6738ScanDots(S); } catch (e) { log("exp6738: dots THREW " + expErr(e)); }
+    try { p6738ScanRows(S); } catch (e) { log("exp6738: rows THREW " + expErr(e)); }
+    try { $.Schedule(P6738_POLL, p6738Tick); } catch (e) {}
+  }
+
+  // 点组判定:面板有 2~6 个子面板,每个子面板文本都是点状字符(三个独立 "." label 的形态)
+  function p6738DotGroup(p) {
+    const n = childCount(p);
+    if (n < 2 || n > 6) return false;
+    let combined = "";
+    for (let i = 0; i < n; i += 1) {
+      const t = safeText(childAt(p, i));
+      if (!t || !P6738_TEXT_RE.test(t)) return false;
+      combined += t;
+    }
+    return combined.length >= 2 && combined.length <= 12;
+  }
+
+  // 父链:id.class 逐级向上(≤6 级),定位面板在树里的位置
+  function p6738Path(p) {
+    const parts = [];
+    let cur = p;
+    for (let i = 0; i < 6 && isValid(cur); i += 1) {
+      let id = "", cls = "";
+      try { id = String(cur.id || ""); } catch (e) {}
+      try { if (cur.GetPanelClassList) cls = String(cur.GetPanelClassList().join(" ").split(" ").join(".")); } catch (e) {}
+      parts.push((id || "-") + (cls ? "." + cls : ""));
+      try { cur = cur.GetParent ? cur.GetParent() : null; } catch (e) { cur = null; }
+    }
+    return parts.join(" < ").slice(0, 240);
+  }
+
+  // 三点候选命中判定(不猜名,三条路命中任一):
+  //   strong(text/dotgroup):文本本身是点状,或子面板全是点 → 直接贡献 dotsOn
+  //   weak(anchor):id/class/src 命中锚定词且文本很短 → 需可见 + 对话框尺寸(≤400×400)才贡献
+  function p6738Hit(p) {
+    const txt = safeText(p);
+    if (txt && P6738_TEXT_RE.test(txt)) return { hit: "text:" + txt, strong: true, txt: txt };
+    let id = "", cls = "", src = "";
+    try { id = String(p.id || ""); } catch (e) {}
+    try { if (p.GetPanelClassList) cls = String(p.GetPanelClassList().join(",")); } catch (e) {}
+    try { src = String(p.src || ""); } catch (e) {}
+    const anchor = P6738_ANCHOR_RE.exec(id + "|" + cls + "|" + src);
+    if (anchor && txt.length <= 12) {
+      return { hit: "anchor:" + anchor[0], strong: false, txt: txt, id: id, cls: cls, src: src };
+    }
+    if (p6738DotGroup(p)) return { hit: "dotgroup", strong: true, txt: txt };
+    return null;
+  }
+
+  function p6738ScanDots(S) {
+    const root = getRoot();
+    if (!root) return;
+    const now = nowMs();
+    const found = {};
+    let scanned = 0;
+    const visit = function (p, depth) {
+      if (!isValid(p) || depth > 30 || scanned > P6738_MAX_NODES) return;
+      scanned += 1;
+      const h = p6738Hit(p);
+      if (h) {
+        let ty = "?", id = h.id, cls = h.cls;
+        try { if (typeof p.type === "string") ty = p.type; } catch (e) {}
+        try { if (id === undefined) id = String(p.id || ""); } catch (e) {}
+        try { if (cls === undefined && p.GetPanelClassList) cls = String(p.GetPanelClassList().join(",")); } catch (e) {}
+        const path = p6738Path(p);
+        const sig = ty + "#" + (id || "-") + "[" + (cls || "") + "]@" + path + ":" + h.txt;
+        let vis = "?", w = -1, hh = -1;
+        try { vis = String(p.visible); } catch (e) {}
+        try {
+          if (typeof p.GetActualLayoutWidth === "function") { w = p.GetActualLayoutWidth(); hh = p.GetActualLayoutHeight(); }
+        } catch (e) {}
+        // 弱命中需可见 + 尺寸像对话框,否则只记录不计入 dotsOn(挡静态 Pending 之类)
+        const usable = h.strong || (vis === "true" && (w < 0 || w <= 400) && (hh < 0 || hh <= 400));
+        const c = S.cands[sig];
+        if (!c) {
+          S.seq += 1;
+          S.cands[sig] = { seq: S.seq, first: now, last: now, open: usable, hit: h.hit };
+          if (S.seq <= P6738_MAX_CAND) {
+            log("exp6738: CAND#" + S.seq + " " + h.hit + (usable ? "" : " (weak-gated off)") +
+              " t=+" + (now - S.t0) + "ms type=" + ty + " vis=" + vis + " wh=" + w + "x" + hh +
+              " path=" + path + " txt=" + JSON.stringify(h.txt));
+          } else if (!S.candCap) {
+            S.candCap = true;
+            log("exp6738: CAND cap " + P6738_MAX_CAND + " reached (counting only)");
+          }
+        } else {
+          c.last = now;
+          if (usable && !c.open) {
+            c.open = true;
+            log("exp6738: BACK#" + c.seq + " t=+" + (now - S.t0) + "ms");
+          } else if (!usable && c.open) {
+            c.open = false;
+          }
+        }
+        found[sig] = 1;
+      }
+      const n = childCount(p);
+      for (let i = 0; i < n; i += 1) visit(childAt(p, i), depth + 1);
+    };
+    visit(root, 0);
+    // 消失/出现结算
+    const openSeqs = [];
+    for (const sig in S.cands) {
+      const c = S.cands[sig];
+      if (c.open && !found[sig]) {
+        c.open = false;
+        if (c.seq <= P6738_MAX_CAND) {
+          log("exp6738: GONE#" + c.seq + " life=" + (now - c.first) + "ms sinceSeen=" + (now - c.last) + "ms");
+        }
+      }
+      if (c.open) openSeqs.push(c.seq);
+    }
+    const on = openSeqs.length > 0;
+    if (S.ticks === 1) {
+      // 首轮基线:若此刻已有强命中,后面 ON/OFF 时间线都要带这个底噪解读
+      log("exp6738: BASELINE open=" + openSeqs.length + " [" + openSeqs.join(",") + "] nodes=" + scanned);
+    }
+    if (on !== S.dotsOn) {
+      S.dotsOn = on;
+      if (on) {
+        S.lastOn = now;
+        if (S.ticks > 1) log("exp6738: DOTS ON t=+" + (now - S.t0) + "ms open=[" + openSeqs.join(",") + "]");
+      } else {
+        S.lastOff = now;
+        if (S.ticks > 1) log("exp6738: DOTS OFF t=+" + (now - S.t0) + "ms 持续=" + (now - S.lastOn) + "ms");
+      }
+    }
+  }
+
+  function p6738ScanRows(S) {
+    const conts = p6738Containers();
+    for (let ci = 0; ci < conts.length; ci += 1) {
+      const key = conts[ci].k, p = conts[ci].p;
+      if (!isValid(p)) continue;
+      const count = childCount(p);
+      if (!(key in S.rows)) { S.rows[key] = count; continue; } // 首见容器:基线,不 dump 历史行
+      let start = S.rows[key];
+      if (count < start) {
+        log("exp6738: RESET " + key + " " + start + "->" + count);
+        start = 0; // 容器清空/重建,镜像主扫描逻辑从头算
+      }
+      for (let i = start; i < count; i += 1) p6738DumpRow(S, childAt(p, i), key, i);
+      S.rows[key] = count;
+    }
+  }
+
+  function p6738DumpRow(S, row, key, idx) {
+    if (!isValid(row)) return;
+    if (S.rowsLogged >= P6738_MAX_ROWS) {
+      if (!S.rowCap) { S.rowCap = true; log("exp6738: row dump cap " + P6738_MAX_ROWS + " reached"); }
+      return;
+    }
+    S.rowsLogged += 1;
+    const now = nowMs();
+    let cls = "", ty = "?";
+    try { if (row.GetPanelClassList) cls = String(row.GetPanelClassList().join(",")); } catch (e) {}
+    try { if (typeof row.type === "string") ty = row.type; } catch (e) {}
+    const txt = collectText(row).slice(0, 100);
+    let rec = null;
+    try { rec = readMessageRow(row); } catch (e) {}
+    // dots/sinceDotsOn:行到达时三点窗口状态(相关性的核心字段)
+    log("exp6738: ROW " + key + "[" + idx + "] quick=" + (rec ? (rec.quick ? 1 : 0) : "?") +
+      " own=" + (rec ? (rec.isOwn ? 1 : 0) : "?") +
+      " dots=" + (S.dotsOn ? 1 : 0) +
+      " sinceDotsOn=" + (S.lastOn ? now - S.lastOn : -1) +
+      " t=+" + (now - S.t0) + "ms" +
+      " type=" + ty + " cls=[" + cls + "] txt=" + JSON.stringify(txt));
+    // 子树 dump(深度≤4,≤32 节点):行上有没有游戏自带的类型标记,一眼可见
+    const lines = [];
+    const visit = function (p, depth) {
+      if (!isValid(p) || depth > 4 || lines.length >= 32) return;
+      let id = "", c = "", t = "?";
+      try { id = String(p.id || ""); } catch (e) {}
+      try { if (p.GetPanelClassList) c = String(p.GetPanelClassList().join(" ").split(" ").join(".")); } catch (e) {}
+      try { if (typeof p.type === "string") t = p.type; } catch (e) {}
+      const tx = safeText(p).slice(0, 40);
+      let wh = "";
+      try {
+        if (typeof p.GetActualLayoutWidth === "function") wh = " " + p.GetActualLayoutWidth() + "x" + p.GetActualLayoutHeight();
+      } catch (e) {}
+      lines.push(new Array(depth + 1).join("  ") + t + "#" + (id || "-") + (c ? "." + c : "") + wh + (tx ? " " + JSON.stringify(tx) : ""));
+      const n = childCount(p);
+      for (let i = 0; i < n; i += 1) visit(childAt(p, i), depth + 1);
+    };
+    visit(row, 0);
+    for (let i = 0; i < lines.length; i += 1) log("exp6738: tree " + lines[i]);
   }
 
   // 导出给 XML 布局调用的全局函数

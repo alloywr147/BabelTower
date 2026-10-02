@@ -7,7 +7,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { parseGameLine, REQ_MAX_PAYLOAD, serveDL } = require("../../core/btipc/transport.js");
+const { parseGameLine, parseTrqEnvelope, REQ_MAX_PAYLOAD, serveDL } = require("../../core/btipc/transport.js");
 const { WindowTable } = require("../../core/btipc/window.js");
 const { encode, decode, busyFrame, buildFrame, FRAME_BYTES } = require("../../core/btipc/framer.js");
 const { crc16 } = require("../../core/btipc/crc16.js");
@@ -141,4 +141,109 @@ test("⑥ 未新增任何位段:BUSY 帧与 DATA 帧布局不变", () => {
 test("译文超 seq7 上限时 encode 抛错(而非静默截断)", () => {
   assert.throws(() => encode(1, Buffer.alloc(1281)), /超出 seq7 上限/);
   assert.strictEqual(encode(1, Buffer.alloc(1280)).length, 128);
+});
+
+// ---------- 4) TRQ 信封(⑥ 上层整合,checklist §14) ----------
+
+test("信封:首行 t=<target>[;tm=<ms>] 拆出目标语言/超时/原文", () => {
+  const e = parseTrqEnvelope("t=en;tm=16000\n你好队友推中路");
+  assert.strictEqual(e.target, "en");
+  assert.strictEqual(e.timeoutMs, 16000);
+  assert.strictEqual(e.text, "你好队友推中路");
+  // tm 可省略(桥回退 config.timeoutMs)
+  const noTm = parseTrqEnvelope("t=zh-Hans\n谢谢");
+  assert.strictEqual(noTm.target, "zh-Hans");
+  assert.strictEqual(noTm.timeoutMs, undefined);
+  assert.strictEqual(noTm.text, "谢谢");
+});
+
+test("信封:裸文本原样透传(向后兼容 /bt6737 冒烟与 E2E)", () => {
+  const e = parseTrqEnvelope("hello world");
+  assert.strictEqual(e.target, undefined);
+  assert.strictEqual(e.timeoutMs, undefined);
+  assert.strictEqual(e.text, "hello world");
+  // 没有换行就不算信封 —— 首行像信封头也不拆
+  const fake = parseTrqEnvelope("t=en;tm=16000 没有换行");
+  assert.strictEqual(fake.target, undefined);
+  assert.strictEqual(fake.text, "t=en;tm=16000 没有换行");
+});
+
+test("信封:target 字符集收紧([A-Za-z0-9-],1..16),不安全值整条按裸文本处理", () => {
+  // 自定义目标语言含空格/Unicode → 不解析,桥回退 config 默认(不猜方向)
+  assert.strictEqual(parseTrqEnvelope("t=zh Hans\nhello").target, undefined);
+  assert.strictEqual(parseTrqEnvelope("t=日本語\nhello").target, undefined);
+  assert.strictEqual(parseTrqEnvelope("t=" + "a".repeat(17) + "\nx").target, undefined);
+  // 边界:1 位与 16 位都收
+  assert.strictEqual(parseTrqEnvelope("t=e\nx").target, "e");
+  assert.strictEqual(parseTrqEnvelope("t=" + "a".repeat(16) + "\nx").target, "a".repeat(16));
+});
+
+test("信封:空原文 + 信封行 → text 空串(桥端 runTranslate 报空文本 → 空 END 帧)", () => {
+  const e = parseTrqEnvelope("t=en\n");
+  assert.strictEqual(e.target, "en");
+  assert.strictEqual(e.text, "");
+});
+
+test("信封往返:游戏侧拼装格式经完整 TRQ 行(§14.1 校验)后逐字节还原", () => {
+  // 拼装方式照抄 lingua_chat.js outgoingViaBtipc(纯字符串拼接)
+  const payload = "t=" + "zh-Hans" + ";" + "tm=" + 16000 + "\n" + "我们这把打上路";
+  const p = parseGameLine(reqLine("TRQ", payload));
+  assert.ok(p.ok, "含信封的 TRQ 行必须通过全部 §14.1 校验");
+  assert.strictEqual(p.translate, true);
+  const e = parseTrqEnvelope(p.payload.toString("utf8"));
+  assert.strictEqual(e.target, "zh-Hans");
+  assert.strictEqual(e.timeoutMs, 16000);
+  assert.strictEqual(e.text, "我们这把打上路");
+});
+
+test("信封不占 J1 预算:信封 + 600B 原文仍 ≤680B,整行 ≤1000", () => {
+  const payload = "t=zh-Hans;tm=16000\n" + "汉".repeat(200); // 19B 信封 + 600B
+  const bytes = Buffer.from(payload, "utf8");
+  assert.ok(bytes.length <= REQ_MAX_PAYLOAD, bytes.length + "B ≤ " + REQ_MAX_PAYLOAD + "B");
+  const line = reqLine("TRQ", payload);
+  assert.ok(line.length <= 1000, "整行 " + line.length + " 字符 ≤ 1000");
+  assert.ok(parseGameLine(line).ok);
+});
+
+// ---------- 5) TRQ op 信封(btipc05:设置面板保存/测试 + 开机读配置迁移) ----------
+
+test("信封 op 键:op=config / op=test 拆出操作与载荷,普通 t= 信封 op 为 undefined", () => {
+  const w = parseTrqEnvelope('op=config\n{"config":{}}');
+  assert.strictEqual(w.op, "config");
+  assert.strictEqual(w.target, undefined);
+  assert.strictEqual(w.timeoutMs, undefined);
+  assert.strictEqual(w.text, '{"config":{}}');
+  const t = parseTrqEnvelope("op=test;tm=11000\nhello");
+  assert.strictEqual(t.op, "test");
+  assert.strictEqual(t.timeoutMs, 11000);
+  assert.strictEqual(t.target, undefined);
+  assert.strictEqual(t.text, "hello");
+  // 翻译信封行为不变(op 缺席)
+  const plain = parseTrqEnvelope("t=en;tm=16000\n你好");
+  assert.strictEqual(plain.op, undefined);
+  assert.strictEqual(plain.target, "en");
+  assert.strictEqual(plain.timeoutMs, 16000);
+  assert.strictEqual(plain.text, "你好");
+});
+
+test("信封 op 白名单:未知 op / 未知键的首行整条按裸文本透传", () => {
+  const u = parseTrqEnvelope("op=health\n{}");
+  assert.strictEqual(u.op, undefined, "白名单外的 op 不得被识别");
+  assert.strictEqual(u.text, "op=health\n{}", "不认识的首行必须原样透传");
+  const k = parseTrqEnvelope("op=config;foo=1\n{}");
+  assert.strictEqual(k.op, undefined, "未知键混入 → 整条按裸文本");
+  assert.strictEqual(k.text, "op=config;foo=1\n{}");
+});
+
+test("信封 op 往返:载荷经完整 TRQ 行(§14.1 校验)后逐字节还原,680B 载荷整行 ≤1000", () => {
+  const payload = "op=config\n" + JSON.stringify({ config: { provider: "bing" } });
+  const p = parseGameLine(reqLine("TRQ", payload));
+  assert.ok(p.ok, "含 op 信封的 TRQ 行必须通过全部 §14.1 校验");
+  assert.strictEqual(p.translate, true);
+  const e = parseTrqEnvelope(p.payload.toString("utf8"));
+  assert.strictEqual(e.op, "config");
+  assert.strictEqual(e.text, JSON.stringify({ config: { provider: "bing" } }));
+  const big = "op=config\n" + "x".repeat(665); // ≈675B ≤ 680B
+  assert.ok(Buffer.byteLength(big, "utf8") <= REQ_MAX_PAYLOAD);
+  assert.ok(reqLine("TRQ", big).length <= 1000, "最坏 op 行 " + reqLine("TRQ", big).length + " ≤ 1000");
 });

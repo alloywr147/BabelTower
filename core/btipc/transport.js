@@ -113,4 +113,36 @@ function serveDL(table, q) {
   return { status: bit ? 200 : 404, bit: bit, win: w, idx: idx, busy: busy };
 }
 
-module.exports = { parseGameLine, serveDL, LINE_MAX, REQ_MAX_PAYLOAD };
+// ---------- TRQ payload 信封(⑥ 上层整合,checklist §14)----------
+// 出站翻译必须把目标语言随请求带到桥端:桥 config 的 defaults.targetLanguage 是入站目标
+// (zh-Hans),出站 outgoingTarget 默认 en —— 不随请求走就会译反方向。
+// 格式(上层约定:payload 对传输层仍是不透明字节,行/帧/窗口协议零改动):
+//   t=<target>[;tm=<ms>]\n<原文>
+// btipc05 增补 op 键(设置面板「保存/测试」+ 开机读配置迁移;旧通道 6726 后已死):
+//   op=<config|test>[;tm=<ms>]\n<载荷>
+//   - op=config:载荷 JSON(读 = {}、写 = {"config":{...}}),响应 JSON(含 maskCompact config)
+//   - op=test  :载荷 JSON({} = 桥端默认 hello/zh-Hans),响应 JSON(translation / error)
+// 键白名单之外的首行(未知 op、未知键、不安全字符集)→ 整条按裸文本一字不差透传
+// (裸文本:/bt6737 冒烟、scripts/btipc_trq_e2e.js、老客户端 → 桥回退 config 默认,向后兼容)。
+const TRQ_ENV_HEAD_RE =
+  /^(?:op=(?:config|test)|t=[A-Za-z0-9-]{1,16})(?:;(?:op=(?:config|test)|t=[A-Za-z0-9-]{1,16}|tm=\d{1,7}))*$/;
+
+function parseTrqEnvelope(raw) {
+  const text = String(raw == null ? "" : raw);
+  const bare = { text: text, target: undefined, timeoutMs: undefined, op: undefined };
+  const nl = text.indexOf("\n");
+  if (nl < 0) return bare; // 没有换行就不算信封(首行像信封头也不算)
+  const head = text.slice(0, nl);
+  if (!TRQ_ENV_HEAD_RE.test(head)) return bare;
+  let op, target, timeoutMs;
+  const segs = head.split(";");
+  for (let i = 0; i < segs.length; i += 1) {
+    const s = segs[i];
+    if (s.indexOf("op=") === 0) op = s.slice(3);
+    else if (s.indexOf("t=") === 0) target = s.slice(2);
+    else if (s.indexOf("tm=") === 0) timeoutMs = parseInt(s.slice(3), 10);
+  }
+  return { text: text.slice(nl + 1), target: target, timeoutMs: timeoutMs, op: op };
+}
+
+module.exports = { parseGameLine, serveDL, parseTrqEnvelope, LINE_MAX, REQ_MAX_PAYLOAD };

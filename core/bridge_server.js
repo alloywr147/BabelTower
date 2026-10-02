@@ -113,33 +113,86 @@ function onBtipcGameLine(line) {
   }
 }
 
+// btipc05:TRQ op 通道 —— 设置面板「保存/测试」+ 开机读配置(旧通道 6726 后已死,迁移)。
+// 载荷/响应回路与 HTTP /api/v1/config、/api/v1/test 同语义(同一 configStore/runTranslate)。
+// 响应恒为 JSON:空响应会被游戏侧判 translate_error,掩盖真实错误。
+async function runBtipcOp(op, body, timeoutMs) {
+  if (op === "config") {
+    let obj = null;
+    try { obj = JSON.parse(body || "{}"); } catch (e) { return { ok: false, error: "bad_json" }; }
+    const current = configStore.load();
+    if (obj.config) {
+      const next = configStore.applyMaskedUpdate(current, obj.config);
+      configStore.save(next);
+      log("info", "config saved (btipc)");
+      return { ok: true, config: configStore.maskCompact(next) };
+    }
+    // 读:与 GET /api/v1/config 同形(精简 mask,title 通道时代为 512B 上限,BTCP 680B 内)
+    return { ok: true, config: configStore.maskCompact(current) };
+  }
+  if (op === "test") {
+    let obj = null;
+    try { obj = JSON.parse(body || "{}"); } catch (e) { obj = null; }
+    const cfg = configStore.load();
+    try {
+      const result = await runTranslate(cfg, {
+        text: (obj && obj.text) || "hello",
+        targetLanguage: (obj && obj.targetLanguage) || "zh-Hans",
+        sourceLanguage: (obj && obj.sourceLanguage) || "auto",
+        timeoutMs: timeoutMs,
+      });
+      log("info", "test ok (btipc)");
+      return { ok: true, translation: result.translation, message: "连接成功" };
+    } catch (e) {
+      log("info", "test failed (btipc): " + ((e && e.message) || String(e)));
+      return { ok: false, error: (e && e.message) || "unknown_error" };
+    }
+  }
+  return { ok: false, error: "unknown_op" };
+}
+
 // ⑥ 翻译请求:窗口先存在(frames=null → 客户端拿 BUSY),数据帧后填充。
 // 翻译耗时(100ms~8s/超时)完全落在窗口等待期,不污染 BTIPC 传输状态机。
 async function onBtipcTranslateReq(parsed) {
   const win = parsed.win;
-  const text = parsed.payload.toString("utf8");
+  const raw = parsed.payload.toString("utf8");
+  // ⑥-整合信封(checklist §14):首行 t=<target>[;tm=<ms>] 携带出站目标语言与翻译超时。
+  // 无信封(/bt6737 冒烟、E2E 裸文本)→ undefined,回退 config 默认(向后兼容)。
+  const env = btipcXfer.parseTrqEnvelope(raw);
+  const text = env.text;
+  const targetLanguage = env.target;
   const tReq = Date.now();
   // acceptReq 建窗;frames 保持 null → serveDL 返 BUSY。setFrames 失败(窗口已 GC)时静默丢弃。
   const tr = btipcTable.acceptReq(win, parsed.id, parsed.payload);
   tr.translate = true;
   btipcTrqInflight.add(win);
   log("info", "BTIPC TRQ w=" + win + " id=" + parsed.id + " len=" + parsed.len +
-      " text=" + JSON.stringify(text.slice(0, 60)) + " (BUSY until translated)");
+      (env.op ? " op=" + env.op : " target=" + (targetLanguage || "(default)")) +
+      " text=" + JSON.stringify(text.slice(0, 60)) + " (BUSY until " + (env.op ? "op handled" : "translated") + ")");
 
   let out = null;
   let errMsg = null;
   try {
-    const cfg = configStore.load();
-    const result = await runTranslate(cfg, { text: text });
-    out = String(result.translation == null ? "" : result.translation);
-    // 缓存非词典命中结果 + 自适应学习(与 /api/v1/translate 同语义)
-    if (result && !result.viaDictionary && !result.viaCache) {
-      const tl = cfg.defaults.targetLanguage || "zh-Hans";
-      transCacheSet(result._protectedText || text, tl, result.translation, result.detectedLanguage);
-      dictionary.record(result._protectedText || text, tl, result.translation, result.detectedLanguage);
+    if (env.op) {
+      out = JSON.stringify(await runBtipcOp(env.op, env.text, env.timeoutMs));
+    } else {
+      const cfg = configStore.load();
+      const result = await runTranslate(cfg, {
+        text: text,
+        targetLanguage: targetLanguage,
+        timeoutMs: env.timeoutMs,
+      });
+      out = String(result.translation == null ? "" : result.translation);
+      // 缓存非词典命中结果 + 自适应学习(与 /api/v1/translate 同语义)
+      if (result && !result.viaDictionary && !result.viaCache) {
+        const tl = targetLanguage || cfg.defaults.targetLanguage || "zh-Hans";
+        transCacheSet(result._protectedText || text, tl, result.translation, result.detectedLanguage);
+        dictionary.record(result._protectedText || text, tl, result.translation, result.detectedLanguage);
+      }
     }
   } catch (e) {
-    errMsg = (e && e.message) || String(e);
+    if (env.op) out = JSON.stringify({ ok: false, error: (e && e.message) || String(e) });
+    else errMsg = (e && e.message) || String(e);
   }
 
   btipcTrqInflight.delete(win);

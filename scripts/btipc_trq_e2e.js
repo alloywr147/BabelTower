@@ -89,12 +89,18 @@ async function runOnce(label, text) {
 }
 
 (async function () {
-  console.log("=== ⑥ 桥级 E2E: TRQ → BUSY → 译文 ===\n");
+  console.log("=== ⑥ 桥级 E2E: TRQ → BUSY → 译文(裸文本兼容 + 信封定向)===\n");
   const a = await runOnce("1st", "hello");
   console.log("");
   const b = await runOnce("2nd(cached)", "hello");
+  console.log("");
+  const c = await runOnce("env-en", "t=en;tm=16000\n你好"); // 信封:出站方向 zh→en(checklist §14)
+  console.log("");
+  const d = await runOnce("env-zh", "t=zh-Hans;tm=16000\nthank you for the help"); // 信封:入站方向 en→zh
   console.log("\n=== 汇总 ===");
   console.log("1st     : " + (a.ok ? "ok busy=" + a.busy + " dt=" + a.dt + "ms out=" + JSON.stringify(a.out) : "FAIL"));
   console.log("2nd cache: " + (b.ok ? "ok busy=" + b.busy + " dt=" + b.dt + "ms out=" + JSON.stringify(b.out) : "FAIL"));
+  console.log("env-en  : " + (c.ok ? "ok busy=" + c.busy + " dt=" + c.dt + "ms out=" + JSON.stringify(c.out) : "FAIL"));
+  console.log("env-zh  : " + (d.ok ? "ok busy=" + d.busy + " dt=" + d.dt + "ms out=" + JSON.stringify(d.out) : "FAIL"));
   process.exit(0);
 })().catch((e) => { console.error("E2E crash: " + (e && e.stack)); process.exit(1); });

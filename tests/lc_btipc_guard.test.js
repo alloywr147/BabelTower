@@ -59,9 +59,10 @@ check("busy 分支置 _btipcDeferred = true", /_btipcDeferred = true/.test(src))
 
 // ---- 4. 版本标 / 前缀常量 ----
 const ver = (src.match(/const VERSION = "([^"]+)"/) || [])[1] || "";
-// 版本号 = 本次发布版(改发布版时此处与 lingua_chat.js VERSION 必须同步),
-// 后缀 btipcNNN 记录构建序;玩家日志 `loaded vX.Y.Z-…` 必须与 Release/GB 标题一致。
-check("VERSION 对齐发布版(含 btipc 标)", /1\.0\.6-6726-btipc\d/.test(ver), "got=" + ver);
+// 版本号 = 当前开发版(与 lingua_chat.js 的 const VERSION 必须同步,升版时两处一起改);
+// 发布时若需与 Release 标签对齐,改完发包后要把这里和 VERSION 一并推到下一开发版,
+// 玩家日志 `loaded vX.Y.Z-…` 才始终能和 Release/GB 页面对上号。
+check("VERSION 已升版(含 btipc 标)", /1\.0\.7-6726-btipc\d/.test(ver), "got=" + ver);
 check("BTIPC 面板前缀 BTIPCD(6 字符,与探针隔离)",
   /BTIPC_PANEL_PREFIX = "BTIPCD"/.test(src));
 

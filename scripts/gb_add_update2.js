@@ -126,16 +126,18 @@ async function setInput(page, selector, value) {
     await sleep(1500);
   }
 
-  // 勾选要发布的文件(匹配 BabelTower-106 优先,回退 105)
+  // 勾选要发布的文件:严格优先 106(本版),105 只作兜底。
+  // 原实现 .find() 返回 DOM 中先出现者,而 babeltower-105-win64.zip 仍在列表里
+  // 且常排在 106 之前 → 会误勾 1.0.5 的包;另有已勾选状态未检查、再点会反勾的风险。
   const fileChecked = await page.evaluate(() => {
     const boxes = [...document.querySelectorAll("input[type=checkbox]")];
-    const target = boxes.find(b => {
-      const label = b.closest(".RadioCheckWrapper");
-      return label && /babeltower-10[56]-win64/i.test(label.innerText);
-    });
-    if (!target) return { ok: false };
-    target.click();
-    return { ok: true, id: target.id };
+    const labelOf = (b) => ((b.closest(".RadioCheckWrapper") || {}).innerText || "");
+    const cands = boxes.filter((b) => /babeltower-10[56]-win64/i.test(labelOf(b)));
+    const target = cands.find((b) => /babeltower-106-win64/i.test(labelOf(b))) || cands[0];
+    if (!target) return { ok: false, total: boxes.length, cands: cands.length };
+    const label = labelOf(target).replace(/\s+/g, " ").trim().slice(0, 60);
+    if (!target.checked) target.click();
+    return { ok: true, id: target.id, label: label, already: target.checked };
   });
   console.log("FILE CHECK:", JSON.stringify(fileChecked));
   await sleep(1000);

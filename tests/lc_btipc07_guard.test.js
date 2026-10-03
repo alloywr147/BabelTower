@@ -156,5 +156,20 @@ ok(/initBakedGameNames\(\); \/\/ btipc07/.test(lc), "boot() 调用 initBakedGame
 ok(/State\.gamenamesFp = LCT_GAMENAMES_PAIRS_FP;/.test(lc), "本地指纹取自烘焙值(握手用)");
 ok(/gamenamesFp: null/.test(lc), "State.gamenamesFp 已声明");
 
+// ---------- ⑧ 2026-10-04 07:00 实车复盘的两处修补 ----------
+console.log("--- 实车复盘:配置同步防重入 + 零传输留痕 ---");
+// 实车当晚 boot() 与 onBridgeAlive() 各起一个 config 同步循环,单槽队列被白占 85s,
+// 把 gamenames/quickchat 握手挤到 07:01:27 才开始。
+ok(/if \(State\.cfgSyncing\) \{/.test(lc), "syncBridgeConfig 在途时直接返回(不并行第二个循环)");
+ok(/State\.cfgSyncWaiters\.push\(callback\)/.test(lc), "在途时把 callback 挂到等待列,不丢事件");
+ok(/State\.cfgSyncing = true;\s*\n\s*let attempts = 0;/.test(lc), "cfgSyncing 由 syncBridgeConfig 自管(boot 未置位也不漏)");
+ok(!/State\.cfgSyncing = true;\s*\n\s*syncBridgeConfig/.test(lc), "onBridgeAlive 不再手动置 cfgSyncing(会与自管打架)");
+ok(/State\.cfgSyncing = false;\s*\n\s*if \(callback\) callback\(\);/.test(lc), "finish() 统一复位并回调等待列");
+// 零传输是常态路径,不落日志就只能靠桥端 out=110B 反推(实车当时就是这么确认的)
+ok(/gamenames sync: fingerprint match, no transfer/.test(lc), "gamenames 零传输成功有日志");
+ok(/quickchat sync: fingerprint match, no transfer/.test(lc), "quickchat 零传输成功有日志");
+ok(/gamenames sync applied: /.test(lc), "gamenames 有数据时有 applied 日志(delta/full)");
+ok(/quickchat templates /.test(lc), "quickchat 有数据时有 adopted 日志");
+
 console.log("RESULT: PASS " + pass + " / FAIL " + fail + " / SKIP " + skipped);
 process.exit(fail > 0 ? 1 : 0);

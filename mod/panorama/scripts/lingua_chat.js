@@ -1531,9 +1531,12 @@
     syncViaBtipc(
       "quickchat",
       QC_LOCAL_META.fingerprint,
-      function () {
+      function (res) {
         // 指纹一致 = 内容逐字相同,标记 synced 即可(无需 adopt,缓存本就是同一份语料)
         quickchatSynced = true;
+        // 同上:零传输成功必须留痕,否则验收时无从判断握手真的走了 same 分支
+        log("quickchat sync: fingerprint match, no transfer (" +
+          ((res && res.count) || QUICKCHAT_TEMPLATES.length) + " templates)");
         return true;
       },
       function (text) {
@@ -3289,8 +3292,8 @@ function injectTranslation(row, sig, text, fragment) {
     State.bridgeOfflineSince = 0;
     setBridgeStatus(t("bridgeOnline") + " \u00b7 " + (State.cfg.provider || "bing"));
     if (!State.cfgSynced && !State.cfgSyncing) {
-      State.cfgSyncing = true;
-      syncBridgeConfig(function () { State.cfgSyncing = false; });
+      // cfgSyncing 由 syncBridgeConfig 自管(防重入:boot 已在途时这里直接返回,不会起第二个循环)
+      syncBridgeConfig();
     }
     // 首次上线:名称保护全量名单 + 快捷语音语料(两段式握手,指纹相同则一条数据都不传)
     if (!State.gamenamesLoaded && !State.gamenamesLoading) {
@@ -5015,8 +5018,29 @@ function injectTranslation(row, sig, text, fragment) {
     // BUGFIX 0.1.3 (again):不能依赖 State.bridgeUp 决定是否重试——
     // bridgeUp 为 true 时一次拉取失败会静默放弃,translateOwn 永远不同步。
     // 改为:只要没同步成功就持续重试(最多 30 次/60 秒),成功后置 State.cfgSynced。
+    //
+    // btipc07 防重入(2026-10-04 07:00 实车):boot() 和 onBridgeAlive() 都会调它,
+    // 而 cfgSyncing 以前只在 onBridgeAlive 里置位 —— 当晚 config 被并行拉了 3 次
+    // (07:00:02 超时 / 07:00:33 一次 25.6s / 07:00:59 一次 28.4s),单槽队列白占 85s,
+    // 把 gamenames/quickchat 握手从 07:00:33 挤到 07:01:27 才开始。
+    // 改为:cfgSyncing 由本函数自管,已在途时直接把 callback 挂到等待列(不新开循环)。
+    if (State.cfgSyncing) {
+      if (callback) {
+        if (!State.cfgSyncWaiters) State.cfgSyncWaiters = [];
+        State.cfgSyncWaiters.push(callback);
+      }
+      return;
+    }
+    State.cfgSyncing = true;
     let attempts = 0;
     const MAX_SYNC_ATTEMPTS = 30;
+    const finish = function () {
+      State.cfgSyncing = false;
+      if (callback) callback();
+      const ws = State.cfgSyncWaiters || [];
+      State.cfgSyncWaiters = [];
+      for (let i = 0; i < ws.length; i++) ws[i]();
+    };
     const trySync = function () {
       attempts += 1;
       bridgePost("config", {}, function (res) {
@@ -5046,12 +5070,12 @@ function injectTranslation(row, sig, text, fragment) {
           // btipc05b:留全量 mask 给面板秒开(openSettingsPanel 直接消费,免 24s 现场读)
           State.cfg._mask = c;
           State.cfgSynced = true;
-          if (callback) callback();
+          finish();
         } else if (attempts < MAX_SYNC_ATTEMPTS) {
           // 拉取失败(桥未就绪/网络抖动/面板未构建):无条件重试,不再依赖 bridgeUp
           $.Schedule(2.0, trySync);
         } else {
-          if (callback) callback();
+          finish();
         }
       });
     };
@@ -5174,7 +5198,13 @@ function injectTranslation(row, sig, text, fragment) {
     syncViaBtipc(
       "gamenames",
       State.gamenamesFp,
-      function () { return true; },
+      function (res) {
+        // 常态路径:打包烘焙值与桥同源,一条数据都不传。这条日志是验收唯一可见的证据
+        // (2026-10-04 07:00 实车发现:此处以前静默,只能靠桥端 out=110B 反推)。
+        log("gamenames sync: fingerprint match, no transfer (" +
+          ((res && res.count) || (State.gamenamesMap && Object.keys(State.gamenamesMap).length) || "?") + " entries)");
+        return true;
+      },
       applyNamesPayload,
       function (ok) {
         if (ok) State.gamenamesLoaded = true;

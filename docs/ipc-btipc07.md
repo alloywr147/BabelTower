@@ -147,16 +147,22 @@ config fp=fnv1a-cde876fa -> match: true
 
 **未动**:`core/btipc/*`、`providers/dictionary/config/css/quickchat`、信封白名单、帧格式、状态机。
 
-## 8. 实车验收清单(待办)
+## 8. 实车验收清单
 
-1. 控制台应出现 `game names: baked pairs loaded (292, fp=fnv1a-cde876fa)`;
-2. 首次 `bridge online (btipc echo)` 后 ≤15 s 内出现 `gamenames sync: fingerprint match`
-   与 `quickchat templates synced` 之类的零传输日志(常态 `total=0`,**不应**出现上百片);
-3. 状态栏在线时应显示 `桥已连接 · <provider>`(老版本一直卡在初始文案);
+**首轮实车(2026-10-04 07:00,详见 checklist §17.8):第 1、3 条 PASS;第 2 条 PASS
+但当时无日志可见(已补,`btipc07b`);第 4、5、6 条未测。**
+
+1. 控制台应出现 `game names: baked pairs loaded (292, fp=fnv1a-cde876fa)` —— ✅ 07:00:02;
+2. 首次 `bridge online` 后 ≤15 s 内出现零传输日志(常态 `total=0`,**不应**出现上百片)
+   —— ✅ 实测 `out=110B` 即 `same=true,total=0`,且 6 分钟内全程零分片;
+   ⚠️ 首轮这条日志不存在(已修);⚠️ 实际因 config 同步重复占槽被挤到 07:01:27(已修);
+3. 状态栏在线时应显示 `桥已连接 · <provider>` —— ✅ 由 `setBridgeStatus` 写
+   `LCTBridgeStatus`,`markBridgeUp` 同步刷新 `LCTBridgeStatusLabel` 与圆点;
 4. 人为制造不一致(改 `config/gamenames.json` 一条译名后重启桥)→ 应看到
-   `mode=delta`、3 片左右收齐、`gamenames applied ... via delta`,期间发消息翻译不卡;
-5. 老包场景(删掉发布包里的 `mod\` 目录)→ 应退 `mode=full`,分片有进度、有预算护栏;
-6. 来回切设置面板 / 关桥,状态栏应在宽限期后变红、恢复后自动清错。
+   `mode=delta`、3 片左右收齐、`gamenames applied … via delta`,期间发消息翻译不卡 —— ⬜ 未测
+   (桥级 E2E 已覆盖同一条链路,29 PASS);
+5. 老包场景(删掉发布包里的 `mod\` 目录)→ 应退 `mode=full`,分片有进度、有预算护栏 —— ⬜ 未测;
+6. 来回切设置面板 / 关桥,状态栏应在宽限期后变红、恢复后自动清错 —— ⬜ 未测。
 
 ## 9. 已知取舍
 

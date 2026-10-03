@@ -689,3 +689,50 @@ quickchat 全量 13 536B → 全量 107~151 片 ≈ **18~25 分钟**。所以:
 
 见 `docs/ipc-btipc07.md` §8(六条)。**本轮未提交前不装车**;装车仍走槽位铁律
 (`local-d0264ee4-f10d-4faf-8ebc-7ace2f340612` → `pak15_dir.vpk`,先备份,游戏运行中禁装)。
+
+### 17.8 首轮实车(2026-10-04 07:00,真游戏)→ 两处修补(`btipc07b`)
+
+**核心路径通过(桥端日志逐条对账)**
+
+| 时刻 | 证据 | 判定 |
+|---|---|---|
+| 07:00:02 | `[LCT] game names: baked pairs loaded (292, fp=fnv1a-cde876fa)` | 烘焙配对装载成功 |
+| 07:01:27 | `op=config {"get":"gamenames","fp":"fnv1a-cde876fa"}` → `ok dt=179ms out=110B frames=11` | **same=true, total=0 零传输** |
+| 07:01:36 | `op=config {"get":"quickchat",…}` → `out=110B` | **零传输** |
+| 07:01:48 | `op=config {"get":"health"}` → `out=47B` | provider/version 明细补上 |
+| 07:01:57~07:07:30 | health REQ echo 每 15s 一次,全部 `DONE frames=1 bytes=6` | 在线稳定,**全程零分片** |
+
+`out=110B` 正好等于 `{"ok":true,"same":true,"kind":"gamenames","mode":"delta","fingerprint":"…","count":292,"total":0}` 的长度——E2E 里同一条应答也是 110B,两边互相印证。
+
+**发现 ① 真回归(本轮引入)—— `syncBridgeConfig` 并行双循环**
+
+`State.cfgSyncing` 以前只在 `onBridgeAlive` 里置位,`boot()` 那次调用没置位 →
+07:00:02 boot 起循环 A(07:00:26 超时 → 07:00:28 requeue),07:00:33 `onBridgeAlive` 看到
+`cfgSyncing=false` 又起循环 B(25.6s),A 的 requeue 07:00:59 到位再来一次(28.4s)。
+**config 被拉了 3 次,单槽队列白占 85s,把 gamenames/quickchat 握手从 07:00:33 挤到 07:01:27。**
+
+修:`cfgSyncing` 改由 `syncBridgeConfig` **自管**;在途时直接把 callback 挂进
+`State.cfgSyncWaiters`,不新开循环;`finish()` 统一复位并回调整个等待列。
+`onBridgeAlive` 侧删掉手动置位(保留 `!cfgSynced && !cfgSyncing` 判定,与自管一致)。
+
+**发现 ② 可观测性缺口 —— 零传输成功完全静默**
+
+`onSame` 分支以前一行日志不打,§8 验收清单第 2 条要求的
+`gamenames sync: fingerprint match` **根本不存在**,当时只能靠桥端 `out=110B` 反推。
+已在两条 `onSame` 里补 `fingerprint match, no transfer (N entries/templates)`,
+并进护栏测试(`lc_btipc07_guard` 53 → **62 PASS**)。
+
+**发现 ③ 假红(已知,本轮不动)**
+
+07:00:02 `bridge offline: 请先启动 core/bridge_server.js` 来自**已死的 panel nav 超时**
+(`warnBridgeOffline`,`State.panelWarned` 去重)——6726 census 里 SetURL 导航全灭,
+这条在桥其实活着时也必报。31s 后被 `markBridgeUp()` 修好(07:00:33)。
+两个桥状态 label(`LCTBridgeStatus` ← `setBridgeStatus`、`LCTBridgeStatusLabel` ←
+`updateBridgeStatusUI`)在 `onBridgeAlive` 后都已回绿,验收第 3 条成立。
+**这是 btipc05e 时代就有的老毛病,不在 btipc07 范围内,记账不修。**
+
+**未覆盖**:本轮没有任何出入站翻译 TRQ(`diag: HUD rows=0`,没发过消息),
+翻译链路本身未复验 —— 但它走的是 btipc05b 的 `op=config` 出站路径,本轮未改动。
+
+**装车**:`bak-pre-btipc07b-20261004-071235`(450084B)→ 槽位 451733B,
+SHA256 `0BF7B6CC1289DE0F` == dist 源;备份链 btipc07b ← btipc07 ← navdeadfix 三级可回滚。

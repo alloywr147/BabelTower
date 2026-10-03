@@ -5,8 +5,11 @@
 
 - 架构:全景(游戏内 Panorama 界面)+ 本地翻译桥(Node.js 本地服务)+ 翻译服务商
 - 默认服务商:**Bing Translator(公共免费接口,免 Key,国内直连可用)**;可选 Microsoft / DeepL / OpenAI 兼容
-- 原理:聊天行扫描 → 去重/缓存 → 隐藏 HTML 面板桥接本地服务 → 译文追加显示
-- 名称保护:启动时从桥动态同步全量 285 条英雄/物品名(桥离线降级到 60 条兜底)
+- 原理:聊天行扫描 → 去重/缓存 → **BTIPC 本地信道**送本地桥 → 译文追加显示
+  (游戏移除 `$.AsyncWebRequest`、6726 更新废掉面板导航后,BTIPC 是唯一在用的通道;
+  三条通道与派发顺序见 [docs/architecture.md](docs/architecture.md) §4.2)
+- 名称保护:翻译前把英雄/物品名换成占位、译完还原;桥在线时从 `/api/v1/gamenames`
+  拉全量名单(292 条,随游戏更新刷新),拉不到时用打包内置的 60 条兜底名单
 - 许可证:**GNU GPL v3**,见 [LICENSE](LICENSE)
 
 > 版本:1.0.7 (2026-10-03)
@@ -22,7 +25,8 @@ BabelTower/
 │   ├── scripts/lingua_chat.js  主逻辑:扫描/去重/缓存/桥接/设置(内部代号 LCT)
 │   └── styles/lingua_chat.css  译文与设置面板样式
 ├── core/                  本地翻译桥(Node.js,零依赖)
-│   ├── bridge_server.js      桥服务器 + 隐藏面板页面
+│   ├── bridge_server.js      桥服务器(/api/v1/* + /bridge + BTIPC 路由)
+│   ├── btipc/                BTIPC 信道实现(crc16 / framer / window / transport)
 │   ├── config.js             本地配置管理(apiKey 打码)
 │   ├── dictionary.js         自适应学习词典(短词直译,见下方教程)
 │   └── providers/            Bing(免 Key)/ Microsoft 双服务商
@@ -32,6 +36,10 @@ BabelTower/
 ├── scripts/autostart.ps1   开机自启安装/卸载
 ├── StartDeadlock.bat       手动启动:桥 + 游戏
 ├── docs/                   架构与开发文档
+│   ├── architecture.md       架构总览 + 三条通信通道 + 翻译服务商协议
+│   ├── btipc-v1.md           BTIPC 协议规格(冻结)
+│   ├── ipc-checklist-6726.md 6726 版本 IPC 排查记录与发版口径
+│   └── development.md        构建 / 冒烟测试 / 常见问题
 └── references/             研究参考材料(原版布局反编译等)
 ```
 
@@ -156,13 +164,19 @@ powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1 -Action Install
 
 > ✅ = 已实现,planned = 计划中。
 
+- ✅ **BTIPC 本地通信层**:游戏移除 `$.AsyncWebRequest`、6726 更新废掉面板导航后,
+  出站翻译 / 入站聊天翻译 / 配置读写改走自研 BTIPC 信道(上行 `console.log` 结构化行 +
+  下行 128 个隐藏面板的位编码帧,CRC + 幂等重试),协议见 [docs/btipc-v1.md](docs/btipc-v1.md)
 - ✅ **更多翻译接口**:DeepL / Google / OpenAI 兼容接口,主服务商失败时自动回退(Thirt927 贡献)
 - ✅ **游戏术语表**:内置词典 2801 条 + 自适应学习(上限 5000/语言)
-- ✅ **名称保护动态同步**:启动时从桥拉取全量 285 条英雄/物品名
-- ✅ **HUD 翻译浮层**:顶栏消息被游戏清理后自动接管显示
+- ✅ **名称保护动态同步**:翻译前占位/译后还原,桥在线时从 `/api/v1/gamenames` 拉全量名单
+  (292 条),桥不可达则用打包内置 60 条兜底
+- ✅ **HUD 翻译浮层**:顶栏消息被游戏清理后自动接管显示(1.0.7 修复气泡不挂译文)
 - ✅ **聊天日志轮转**:单文件 5MB 自动归档,30 天清理
 - ✅ **Bing 指数退避**:限流时自动退避重试
 - ✅ **UMM 设置联动**:安装 [Universal Mod Manager](https://gamebanana.com/mods/693642) 后可在其设置窗口调整 Babel Tower 常用选项(不装 UMM 完全不影响本 mod)
+- planned **统一通信通道**:health / 快捷语音语料 / 名称保护同步也迁到 BTIPC,
+  清掉旧面板通道每 15s 一条的死链日志
 - planned **翻译失败提示**:游戏内显示翻译失败/桥离线状态,不再静默
 - planned **界面多语言**:设置面板支持中/英文界面(跟随游戏语言)
 - planned **Linux 移植**:支持 Steam Deck / Proton 环境

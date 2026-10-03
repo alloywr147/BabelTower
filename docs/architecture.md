@@ -2,31 +2,37 @@
 
 ## 1. 总览
 
-```
-┌──────────────────────── 游戏进程 ────────────────────────┐
-│  Panorama(聊天 UI)                                        │
-│  ┌────────────────────────────────────────────┐          │
-│  │ lingua_chat.js                              │          │
-│  │  扫描 #ChatMessages 行                      │          │
-│  │  签名去重 / 缓存 / 语言启发式                │          │
-│  │  队列(串行)                                 │          │
-│  │  隐藏 HTML 面板 ── BLoadUrl ──┐             │          │
-│  │  (轮询 panel.title 读回)      │             │          │
-│  └───────────────────────────────┼─────────────┘          │
-└───────────────────────────────────┼───────────────────────┘
-                                    │ localhost:8791(仅本机)
-┌───────────────────────────────────┼───────────────────────┐
-│  本地翻译桥 Node.js(core/)         │                       │
-│  /bridge 页面(同源 fetch 受限 API) ◄┘                       │
-│  /api/v1/translate|test|config|health                      │
-│  providers/*.js ── HTTPS ──► 翻译服务商                     │
-│  (bing免Key/Azure/DeepL/Google/OpenAI兼容,见 §6)           │
-└────────────────────────────────────────────────────────────┘
+```text
+游戏进程(Panorama)
+  lingua_chat.js
+    扫描 #ChatMessages 行 → 签名去重 / 缓存 / 语言启发式 → 串行队列(MAX_ACTIVE=1)
+    译文追加显示(聊天行下方 / HUD 顶栏气泡 / 大厅聊天记录)
+
+    与本地桥的三条通道(dispatchJob 按序尝试):
+      ① BTIPC     出站翻译、入站聊天翻译、配置读写(op=config)、测试(op=test)
+                   上行 console.log 行 "[LCT] BTIPC REQ ..." → 桥 tail 轮询读回
+                   下行 128 个隐藏 Image 面板轮询 GET /btipc/dl 取 16 字节帧
+      ② 直连      $.AsyncWebRequest → GET/POST /api/v1/*
+      ③ 面板导航  隐藏 HTML 面板 SetURL → /bridge 页面,轮询 document.title 读回
+
+                    │ 127.0.0.1:8791(仅本机)
+                    ▼
+本地翻译桥 Node.js(core/)
+  /btipc/dl + console.log tail   ← ① BTIPC(协议与状态机见 docs/btipc-v1.md)
+  /bridge                        ← ③ HTML 面板页面(结果写 document.title)
+  /api/v1/translate|test|config|health|quickchat|gamenames|log|version-check  ← ②
+  providers/*.js ── HTTPS ──► 翻译服务商(Bing免Key / Azure / DeepL / Google / OpenAI 兼容,见 §6)
 ```
 
-游戏内的 Panorama 无法直接发 HTTP(Deadlock 移除了 `$.WebRequest`),
-因此用**隐藏 HTML 面板**加载本地桥页面;页面内 JS 在同源下调用受限 API,
-再把结果写回 `document.title`,Panorama 轮询读取(带请求 id 前缀防串扰)。
+游戏内的 Panorama 无法直接发 HTTP:`$.AsyncWebRequest` 已被游戏移除(调用即抛
+`AsyncWebRequest has been removed.`),隐藏 HTML 面板的 `SetURL` 导航在 2026-09-30
+的 **6726** 更新后也静默失效(`src=""`、`act=0`,桥日志记 `bridge nav failed: panel dead`)
+—— 所以 **BTIPC 是当前唯一在用的通道**,②③ 保留为兜底分支。详见 §4.2。
+
+> 2026-10-03 实测(`logs/bridge.log`):
+> `bridge transport: AsyncWebRequest removed/unavailable, using HTML panel channel`、
+> `bridge nav failed: panel dead (no lct-alive within 1.5s) | title(undefined)="" act=0 src=""`
+> 与 `BTIPC TRQ w=.. op=config text="{}"` + `boot: config synced from bridge` 同时存在。
 
 ## 2. 消息流(收)
 
@@ -34,29 +40,62 @@
 2. 从每行提取:频道(ChannelName)、发送者(SenderName)、正文(MessageContents)
 3. 签名 = `channel \x00 sender \x00 text`,用于去重(Set)与缓存(Map)
 4. 过滤:空/短文本、纯数字符号、`/` 指令、自己的消息、已为目标语言(启发式)
-5. 入队 → 串行翻译(MAX_ACTIVE=1)→ 成功追加译文 Label / 失败红字(重试 1 次)
+5. 入队 → 串行翻译(MAX_ACTIVE=1)→ 成功追加译文 Label / 失败红字(重试 1 次);
+   翻译请求经 §4.2 的 ① BTIPC 送桥、译文从同一条信道的入站帧读回
 6. 聊天滚动回收后,签名命中缓存则自动重建译文
+7. 快捷语音轮盘消息(模板命中)直接 skip 不送翻;模板语料由桥同步或打包兜底
+   (`core/quickchat.js` 生成,见 `tests/quickchat_match.test.js`)
 
 ## 3. 消息流(发)
 
 - `chat.xml` 的 TextEntry `oninputsubmit` 改由 `LCTOnChatSubmit()` 接管
 - `/tr` → 打开设置面板,不发送
-- 发送前翻译开启 → 先翻译输入文本,再派发 `CitadelChatInputSubmitted` 事件
-  触发原版发送(该事件路径在 poker 系 mod 中已验证可用)
+- 发送前翻译开启 → 先翻译输入文本(经 §4.2 的 ① BTIPC,超时/通道不可用则**按原文发送**),
+  再派发 `CitadelChatInputSubmitted` 事件触发原版发送(该事件路径在 poker 系 mod 中已验证可用)
 - 其余情况直接派发事件,行为与原版一致
 
 ## 4. 桥协议(受限,非通用代理)
 
+### 4.1 端点
+
 | 端点 | 方法 | 说明 |
 | --- | --- | --- |
-| `/bridge?id=..&op=..&text=..&source=..&target=..` | GET | 隐藏面板页面;结果写回 document.title = `LCT<id>+JSON` |
+| `/btipc/dl?w&r&p&t` | GET | **① BTIPC 下行**:位=1 → 200 PNG,位=0 → 404(见 [btipc-v1.md](btipc-v1.md)) |
+| `[LCT] BTIPC REQ/CAN ...` | console.log tail | **① BTIPC 上行**:游戏写结构化行,桥轮询 `console.log` 读回 |
+| `/bridge?id=..&op=..&text=..&source=..&target=..` | GET | **③** 隐藏面板页面;结果写回 document.title = `LCT<id>+JSON` |
 | `/api/v1/translate` | POST | `{operation,provider,text,sourceLanguage,targetLanguage}` → `{ok,translation,detectedLanguage}` |
 | `/api/v1/test` | POST | 用当前配置翻译固定文本,验证 Key |
 | `/api/v1/config` | GET/POST | 读(打码)/写(支持打码回传)配置 |
 | `/api/v1/health` | GET | 健康检查 |
+| `/api/v1/quickchat` | GET | 快捷语音模板语料(桥从本机游戏 loc 实时生成,含指纹) |
+| `/api/v1/gamenames` | GET | 英雄/物品名保护名单(`config/gamenames.json`) |
+| `/api/v1/log` | GET/POST | 游戏侧日志上报(诊断探针) |
+| `/api/v1/version-check` | GET | 版本检查 |
 
 安全:仅监听 127.0.0.1;请求体 ≤64KB;单文本 ≤4000 字符;无任意 URL 代理;
 日志不含 apiKey;apiKey 只在本地 `config/config.json`(gitignore)。
+
+### 4.2 游戏 → 桥:三条通道与派发顺序(`dispatchJob`)
+
+| 优先级 | 通道 | 承载的请求 | 状态(2026-10-03 实测) |
+| --- | --- | --- | --- |
+| ① | **BTIPC**(协议 [btipc-v1.md](btipc-v1.md),实现在 `core/btipc/`) | 出站翻译、入站聊天翻译、配置读写 `op=config`、测试 `op=test` | ✅ **在用**:`BTIPC TRQ w=.. op=config` + `boot: config synced from bridge` |
+| ② | 直连 `$.AsyncWebRequest` → `/api/v1/*` | 其余桥接口(health / quickchat / gamenames / log)、①接不了时的回退 | ❌ 游戏已移除该 API,调用即抛 `AsyncWebRequest has been removed.`;探测日志 `bridge transport: AsyncWebRequest removed/unavailable` |
+| ③ | 隐藏 HTML 面板 `SetURL` → `/bridge` + `document.title` 轮询 | ②不可用时的回退 | ❌ 6726 更新后导航静默失效,日志 `bridge nav failed: panel dead (no lct-alive within 1.5s) … src=""` |
+
+- ① 接不了的三种情形(`payload > 680B` 的 `too_long`、目标语言不在 `[A-Za-z0-9-]` 安全字符集、
+  通道忙等超过死线)会**回落 ②→③**;两条旧通道都不可用时,出站**按原文发送**、
+  配置/测试操作回 `{ok:false, error}`(状态栏给出具体错误)。
+- BTIPC 忙时**不立刻回落**:chat/outgoing 短等 `6 × 0.5s`(死线 12s),op 等满读死线
+  (50s)+2s 缓冲,避免掉进必死的旧通道。
+- **已知欠账**:②③ 尚未迁 BTIPC 的接口(`health`、`quickchat`、`gamenames` 动态同步)
+  在当前游戏版本实际不可达 → 游戏侧降级走**打包内置**兜底:
+  - 快捷语音模板 → `lingua_chat_quickchat_fallback.js`(构建时由 `node core/quickchat.js`
+    从本机游戏 loc 重新生成;指纹不一致本应采纳桥侧语料,现在拿不到桥响应只能一直用打包版);
+  - 名称保护名单 → `lingua_chat.js` 内硬编码的约 60 条 `PROTECT_NAMES`
+    (桥侧全量 292 条在 `config/gamenames.json`,日志里 `game names synced from bridge` 因此从不出现);
+  同时每 15s 打一条 `bridge nav failed: panel dead` 死链日志。
+  这些接口迁 BTIPC + 清死链是下一阶段任务(btipc07)。
 
 ## 5. 配置
 

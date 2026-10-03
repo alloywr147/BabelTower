@@ -2,23 +2,32 @@
 
 ## 1. 当前状态与验证情况
 
-**本地桥(core/)**:已实现并通过本地端到端测试
+**发布状态**:`1.0.7 (2026-10-03)` 已同时发布 GitHub Release(`v1.0.7`)与 GameBanana;
+版本号跨渠道共用、口径见 `ipc-checklist-6726.md` §16.7。
+
+**本地桥(core/)**:零依赖 Node.js,已通过本地端到端测试
 (health / config 读写与打码回传 / translate 与 test 的真实 HTTP 链路;
 Bing 免 Key 与 Microsoft 双服务商均已实测,真实译文验证通过)。
 
-**游戏内 Panorama(mod/)**:**未在游戏内实际运行**,但已做两层静态验证:
+**游戏内 Panorama(mod/)**:**已实车验证**(2026-10-03 多轮,记录见
+`ipc-checklist-6726.md` §16.5)。当前各子系统状态:
 
-- 编译产物经 Source 2 Viewer 19.2(Valve 官方参考实现)解编译,完整还原
-  (含 `<HTML id="LCTBridgePanel" class="LCTBridgePanel" />` 声明、全部中文文本与处理器)
-- 与 DLCT 已发布 VPK(`Deadlock\DLCT\pak01_dir.vpk`)解编译结果逐项对照,
-  关键机制一致(见下)
+| 子系统 | 状态 | 依据 |
+| --- | --- | --- |
+| 收/发消息翻译、译文追加、缓存重建 | ✅ 实车可用 | `!lcttest hello` → `translated [hud] …你好`;轮盘 13 条全部正确跳过 |
+| HUD 顶栏气泡挂译文 | ✅ 实车可用(1.0.7 修复) | 用户肉眼确认;修复前打字消息此处 100% 空白 |
+| 配置读写(设置面板保存/测试 + 开机同步) | ✅ 实车可用 | 日志 `BTIPC TRQ … op=config` + `boot: config synced from bridge` |
+| **BTIPC 信道**(出站翻译 / 入站翻译 / 配置) | ✅ 实车可用 | 协议 `btipc-v1.md`,`dispatch THREW = 0` |
+| `$.AsyncWebRequest` 直连 | ❌ 游戏已移除该 API | `ERROR: AsyncWebRequest has been removed.` |
+| 隐藏 HTML 面板 `SetURL` 导航 | ❌ 6726 更新后失效 | `bridge nav failed: panel dead … src=""` |
+| health / 快捷语音 / 名称保护动态同步 | ⚠️ 走上面两条旧通道 → 实际用打包内置兜底 | 待迁 BTIPC,见 `architecture.md` §4.2 |
 
 ### 已确认的技术事实(通过 DLCT VPK 解编译验证,2026-08-03)
 
 1. **HTML 面板必须用 XML `<HTML id="..." />` 标签声明**
    (运行时 `$.CreatePanel("HTML", ...)` 不会得到可用的 HTML 面板;
    DLCT 声明为 `<HTML id="DlctBridge" class="DlctBridge" />`)
-2. **加载方法:`panel.SetURL(url)`**(不是 BLoadUrl)
+2. **加载方法:`panel.SetURL(url)`**(不是 BLoadUrl)—— 该通道在 6726 后已失效,留作历史
 3. **读回:`panel.title`**(页面把 `id+JSON` 写进 document.title,Panorama 轮询读取;
    DLCT 另有 GetAttributeString 兜底)
 4. **提交处理器接管模式成立**:DLCT 的 TextEntry 同样改为
@@ -29,21 +38,30 @@ Bing 免 Key 与 Microsoft 双服务商均已实测,真实译文验证通过)。
 
 ### 仍需游戏内验证/微调的点
 
-1. **HTML 面板通道**:若译文仍不出现,看游戏控制台 `[LCT] bridge panel found;
-   SetURL=yes/no` 与 `bridge online` 日志定位
-2. **发送接管**:万一聊天发不出去,回退:chat.xml 的 TextEntry 改回
+1. **发送接管**:万一聊天发不出去,回退:chat.xml 的 TextEntry 改回
    `oninputsubmit="CitadelChatInputSubmitted();"`(失去 /tr 与发送前翻译,收发正常)
-3. 设置面板定位(负偏移)与 ToggleButton 文本显示,需游戏内微调 CSS
-4. 聊天新消息类型(反编译 snippet 之外的)未渲染时,按缺失 snippet 补上
+2. 设置面板定位(负偏移)与 ToggleButton 文本显示,需游戏内微调 CSS
+3. 聊天新消息类型(反编译 snippet 之外的)未渲染时,按缺失 snippet 补上
+4. 出站翻译的**队友视角**可见性(我方日志与 HUD 已通,对面看到的译文待复核)
+5. health / 快捷语音 / 名称保护同步迁 BTIPC 后的实车复验(btipc07)
 
 ## 2. 冒烟测试清单(首次进游戏)
 
 1. 用 `StartDeadlock.bat` 启动(或手动 `node core\bridge_server.js` 再开游戏)
-2. 训练场/机器人房间打开聊天,发一条外语消息
-3. 期望:几秒内消息下方出现译文;桥控制台出现 `translate ok` 日志
-4. 设置面板:`/tr` 打开 → 服务商 bing → 测试 → 保存(无需任何 Key)
-5. 聊天滚动(消息多到回收)后,译文应从缓存重建
-6. 打开 VConsole / Panorama 调试器,确认无 `[LCT]` 相关报错
+2. 看游戏日志首屏:版本串 `loaded <const VERSION>` + `boot: config synced from bridge`
+   (后者 = BTIPC 配置读通了,是"桥连上了"的可靠信号)
+3. 训练场/机器人房间打开聊天,发一条外语消息
+4. 期望:几秒内消息下方出现译文;`logs\bridge.log` 出现 `translate ok`
+5. 设置面板:`/tr` 打开 → 服务商 bing → 测试 → 保存(无需任何 Key)
+   日志应出现 `BTIPC TRQ … op=test` / `op=config`,而不是 `panel_channel_unavailable`
+6. 打字发一条本已是目标语言的短语(如 `ggwp`)→ HUD 顶栏气泡下应挂出译文
+7. 快捷语音轮盘发几条(如 `上了` / `攻击 1 级` / `谢了!`)→ 应**不**被翻译
+8. 聊天滚动(消息多到回收)后,译文应从缓存重建
+9. 打开 VConsole / Panorama 调试器,确认无 `[LCT]` 相关报错
+
+> 日志噪声:`bridge nav failed: panel dead (no lct-alive within 1.5s)` 每 15s 一条,
+> 是旧 HTML 面板通道的死链(该接口尚未迁 BTIPC,归 btipc07),**不代表桥挂了**;
+> 判断桥是否活着看 `BTIPC TRQ` / `boot: config synced`。
 
 ## 3. 构建
 

@@ -1,6 +1,10 @@
 # BTIPC v1 Protocol Specification(冻结版 2026-10-02)
 
-> 状态:**冻结**(规格即契约,实现须逐条对齐;改动需升版本)。
+> 状态:**冻结 + 已实现并实车验收**(规格即契约,实现须逐条对齐;改动需升版本)。
+> **落地**:随 `1.0.7 (2026-10-03)` 发布,承载出站翻译 / 入站聊天翻译 / 配置读写(`op=config`,`op=test`)。
+> 当前游戏版本已移除 `$.AsyncWebRequest`、6726 更新又废掉面板 `SetURL` 导航,
+> **BTIPC 是唯一可用的桥通道**(三通道现状见 `architecture.md` §4.2)。
+> 实现文件:`core/btipc/{crc16,framer,window,transport}.js` + 游戏侧 `lingua_chat.js` 的 `State.btipc`。
 > 2026-10-02 十点终审已并入:位段显式化(§3.2)/ CRC 范围锁定(§3.2)/ BUSY 固定帧(§3.2)/ round 写死(§4.0)/ 参数补全(§9)/ 位序正式例(§3.3)/ Promise API(§7)/ 文件结构与顺序(§13)/ Security(§14)/ 评价表(§15)。
 > 数据依据:`docs/ipc-downlink-benchmark-6734D.md`(D 组,run=324926 + 新 build 复验 890861)、`docs/ipc-multivalue-benchmark-6734E.md`(E 组,run=615338 + 新 build 复验 261844)、checklist §7~§8。
 > 适用 build:25658155(已复验);25639407(兼容,参数取保守值)。
@@ -176,6 +180,26 @@ T_close 方案下,风暴 = 大量 CRC fail → 升级宽闭合,不需要额外�
 - 长度预算:完整 console.log 行 = 引擎前缀(≈24,含时间戳)+ `[LCT] ` + 行头 48 + b64;J1 实测上限 1000 → b64 ≤908 → **payload ≤680B**(§9 REQ_MAX_PAYLOAD;BTIPC.request 超限立即 reject too_long);按字节计不按字符计;
 - 桥端校验 len/crc(此处 CRC 仅覆盖 payload,REQ 行尚无帧头;帧级 CRC 见 §3.2)/base64/windowId 格式,失败**静默丢弃**(完整规则见 §14);幂等:游戏侧超时重发 REQ,同 w 幂等覆盖。
 
+### 5.1 上层信封(payload 首行;不动 §3~§6 的冻结协议)
+
+传输层把 payload 当**不透明字节**;上层在 payload 开头约定一行信封头 + `\n`:
+
+```text
+t=<target>[;tm=<ms>] \n <原文>        出站翻译(目标语言必须随请求走,否则桥按默认译反方向)
+op=test[;tm=<ms>]    \n <JSON>        测试:载荷 {}(桥用默认 hello / zh-Hans);响应 JSON(translation / error)
+op=config            \n <JSON>        配置:读 = {},写 = {"config":{...}};响应 JSON(含 maskCompact)
+<裸文本>                             无换行 / 首行不匹配信封头 → 一字不差透传
+```
+
+- **白名单**(实现:`core/btipc/transport.js` 的 `TRQ_ENV_HEAD_RE`)只有
+  `op=config|test`、`t=[A-Za-z0-9-]{1,16}`、`tm=\d{1,7}`;
+- 未知 `op`、未知键、不安全字符集 → 整条按裸文本透传(裸文本 = 冒烟 `/bt6737`、
+  `scripts/btipc_trq_e2e.js`、老客户端;桥回退 config 默认 target,向后兼容);
+- 游戏侧在**目标语言不在 `[A-Za-z0-9-]{1,16}` 时主动回落旧通道**,不让桥端信封解析失败
+  而译成错误方向;
+- **读写死线分离**:写应答 1 帧(`{ok:true}`)→ 8s;读应答 `maskCompact` ≈400B = 40 帧 ×
+  真机 600ms/帧 ≈ 24s → 50s(btipc05d,覆盖首发起跑竞态 + 中途 CRC 重试的最坏 ≈43s)。
+
 ---
 
 ## 6. 桥端状态机(per window)
@@ -328,6 +352,12 @@ IDLE → REQ_SENT(发 REQ 行 + 启动轮询 r=1)
 5. **实车端到端**:真实对局 `/tr` 开启发送前翻译 → 英文消息 → 队友可见译文,日志含逐帧 `BTIPC: r=.. seq=.. OK` 全序列;
 6. **风暴演练**:进图加载期发起一次传输 → 升级路径生效,最终 DONE。
 
+**当前完成度(2026-10-03)**:`§12.1~12.3` 离线验收全绿(`node tests\btipc\*.test.js`,
+crc / frame / simulator / window_gc);`§12.4` 实车回声、`§12.5` 端到端(出站
+`!lcttest hello` → HUD 译文、入站轮盘 13 条正确跳过)已通过,取证见
+`ipc-checklist-6726.md` §16.5;`§12.6` 风暴升级路径在实车日志中出现并恢复
+(`lingua_chat.js` btipc05c/05d 注释记有 STORM 罚时现场),**尚缺一轮专门的进图演练复核**。
+
 ---
 
 ## 13. 实现清单与顺序
@@ -381,6 +411,11 @@ F:\BabelTower\
 **回声先行**:第 1~5 步全绿 + 实车 `/bt6736` 回声 "Hello BTIPC" ≥20 连发零 fail,才允许接翻译 API。
 
 **隔离铁律**:BTIPC 代码不得调用/修改 exp6727~6734 探针的 State 字段;探针退役时(封版剥离)BTIPC 独立存活。
+
+> **落地状态(2026-10-03)**:13.3 的 1~6 步全部完成,随 `1.0.7` 发布。
+> 第 6 步的"接入"随 btipc04(入站 chat)与 btipc05(`op=config` / `op=test`)扩到
+> 四类业务,调度入口是 `lingua_chat.js` 的 `dispatchJob`:先试 ① BTIPC,
+> 接不了才回落 ② 直连 / ③ 面板导航(当前游戏版本两条都不可用,故 ① 实际不可退)。
 
 ---
 

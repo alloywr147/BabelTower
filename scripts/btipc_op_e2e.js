@@ -1,7 +1,9 @@
 "use strict";
-// btipc05 离线 E2E:TRQ op 通道(设置面板 保存/测试 + 开机读配置)三连。
+// btipc05b 离线 E2E:TRQ op 通道(设置面板 保存/测试 + 开机读配置)四连 + **游戏死线断言**。
 // 手法与 btipc_trq_e2e.js 相同:向 console.log 尾部写 TRQ 行(桥 tail 认为是游戏),
-// 再 HTTP 查询 /btipc/dl 逐帧收响应解码 —— 不碰游戏、不碰面板通道。
+// 再 HTTP 查询 /btipc/dl 逐帧收响应解码(自带 600ms/帧真机节拍)—— 不碰游戏、不碰面板通道。
+// btipc05 教训:内容全对但 dt 超游戏死线 = 实车必挂(读应答 40 帧 ×600ms ≈24s > 8s,
+// 游戏实车 34 连败而 E2E 当时 4/4 绿)。故本版每项断言都卡 dt。
 // 跑法: node scripts/btipc_op_e2e.js
 const fs = require("node:fs");
 const http = require("node:http");
@@ -80,12 +82,16 @@ async function runOnce(label, text) {
 }
 
 (async function () {
-  console.log("=== btipc05 op E2E: config 读 / config 写 / test ===\n");
+  // 游戏侧死线(btipc05b):op=config 读 35000 / 写 8000 / op=test max(cfg,15000)
+  const B_READ = 35000, B_WRITE = 8000, B_TEST = 15000;
+  console.log("=== btipc05b op E2E: config 读(死线35s) / config 写(8s) / 写后读回 / test(15s) ===\n");
   const a = await runOnce("cfg-read", "op=config\n{}");
   console.log("");
   const b = await runOnce("cfg-write", "op=config\n" + JSON.stringify({ config: { chatLog: { enabled: true } } }));
   console.log("");
-  const c = await runOnce("test", "op=test;tm=11000\n{}");
+  const c = await runOnce("cfg-readback", "op=config\n{}");
+  console.log("");
+  const d = await runOnce("test", "op=test;tm=11000\n{}");
   console.log("\n=== 汇总 ===");
 
   let pass = 0;
@@ -93,19 +99,22 @@ async function runOnce(label, text) {
     console.log(label + ": " + (cond ? "PASS" : "FAIL " + why));
     if (cond) pass += 1;
   };
-  let jA = null, jB = null, jC = null;
+  let jA = null, jB = null, jC = null, jD = null;
   try { jA = JSON.parse(a.out); } catch (e) {}
   try { jB = JSON.parse(b.out); } catch (e) {}
   try { jC = JSON.parse(c.out); } catch (e) {}
+  try { jD = JSON.parse(d.out); } catch (e) {}
 
-  check("cfg-read", a.ok && jA && jA.ok === true && jA.config && jA.config.ui !== undefined,
-    "期望 {ok:true,config:{ui,...}} got=" + JSON.stringify(a.out.slice(0, 120)));
-  check("cfg-write", b.ok && jB && jB.ok === true && jB.config && typeof jB.config.chatLog === "object",
-    "期望 {ok:true,config:{chatLog:{enabled:true},...}} got=" + JSON.stringify(b.out.slice(0, 120)));
-  check("cfg-write 语义", jB && jB.config && jB.config.chatLog && jB.config.chatLog.enabled === true,
-    "chatLog.enabled 应为 true");
-  check("test", c.ok && jC && jC.ok === true && typeof jC.translation === "string" && jC.translation.length > 0,
-    "期望 {ok:true,translation:\"...\"} got=" + JSON.stringify(c.out.slice(0, 120)));
-  console.log("\nRESULT: " + pass + " / 4");
-  process.exit(pass === 4 ? 0 : 1);
+  check("cfg-read 内容+死线", a.ok && a.dt <= B_READ && jA && jA.ok === true && jA.config && jA.config.ui !== undefined,
+    "期望 {ok:true,config:{ui,...}} dt<=" + B_READ + " got=" + JSON.stringify(a.out.slice(0, 120)) + " dt=" + a.dt);
+  check("cfg-write 应答瘦身+死线", b.ok && b.dt <= B_WRITE && jB && jB.ok === true && jB.config === undefined,
+    "期望 {ok:true}(无 config 字段) dt<=" + B_WRITE + " got=" + JSON.stringify(b.out.slice(0, 120)) + " dt=" + b.dt);
+  check("cfg-write 真落盘(读回验证)", c.ok && jC && jC.ok === true && jC.config && jC.config.chatLog && jC.config.chatLog.enabled === true,
+    "读回的 chatLog.enabled 应为 true got=" + JSON.stringify(c.out.slice(0, 160)));
+  check("cfg-readback 死线", c.ok && c.dt <= B_READ, "读回 dt=" + c.dt + " 应 <= " + B_READ);
+  check("test 内容+死线", d.ok && d.dt <= B_TEST && jD && jD.ok === true && typeof jD.translation === "string" &&
+    jD.translation.length > 0 && jD.message === undefined,
+    "期望 {ok:true,translation:\"...\"} 且无 message dt<=" + B_TEST + " got=" + JSON.stringify(d.out.slice(0, 120)) + " dt=" + d.dt);
+  console.log("\nRESULT: " + pass + " / 5");
+  process.exit(pass === 5 ? 0 : 1);
 })().catch((e) => { console.error("E2E crash: " + (e && e.stack)); process.exit(1); });

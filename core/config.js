@@ -171,9 +171,12 @@ function maskCompact(cfg) {
   const c = normalize(cfg);
   const out = {
     provider: c.provider,
-    fallbackProviders: Array.isArray(c.fallbackProviders) ? c.fallbackProviders : [],
     ui: Object.assign({}, DEFAULTS.ui, c.ui || {}),
   };
+  // 空列表省略(≈32B):游戏侧 Array.isArray 护栏,缺省=无回退(btipc05b 省帧)
+  if (Array.isArray(c.fallbackProviders) && c.fallbackProviders.length) {
+    out.fallbackProviders = c.fallbackProviders;
+  }
   out.microsoft = { hasApiKey: !!(c.microsoft && c.microsoft.apiKey) };
   // region 非机密,回传给游戏面板做回填(否则每次打开都是空,用户误以为没保存)
   if (c.microsoft && c.microsoft.region) out.microsoft.region = c.microsoft.region;

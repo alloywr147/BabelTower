@@ -125,9 +125,13 @@ async function runBtipcOp(op, body, timeoutMs) {
       const next = configStore.applyMaskedUpdate(current, obj.config);
       configStore.save(next);
       log("info", "config saved (btipc)");
-      return { ok: true, config: configStore.maskCompact(next) };
+      // btipc05b:写应答只回 {ok:true}。原先回 maskCompact(≈400B=40 帧)在真机
+      // 600ms/帧节拍下要 24s+ —— 游戏侧 8s 死线必超时,实车 34 连败(UI 报假失败,
+      // 其实已落盘)。保存方用本地收集的 p 回填,不需要回执里的 config。
+      return { ok: true };
     }
-    // 读:与 GET /api/v1/config 同形(精简 mask,title 通道时代为 512B 上限,BTCP 680B 内)
+    // 读:与 GET /api/v1/config 同形(精简 mask)。体积 ≈400B=40 帧 ×600ms/帧 ≈24s,
+    // 游戏侧 op=config 读分支已配 35s 死线(btipc05b),此处只管给全量。
     return { ok: true, config: configStore.maskCompact(current) };
   }
   if (op === "test") {
@@ -142,7 +146,9 @@ async function runBtipcOp(op, body, timeoutMs) {
         timeoutMs: timeoutMs,
       });
       log("info", "test ok (btipc)");
-      return { ok: true, translation: result.translation, message: "连接成功" };
+      // btipc05b:去掉 message(≈30B≈3 帧)——游戏侧只读 translation,瘦身让应答
+      // 稳落 3 帧内,免 CRC 重试偶发顶到 8s 死线。
+      return { ok: true, translation: result.translation };
     } catch (e) {
       log("info", "test failed (btipc): " + ((e && e.message) || String(e)));
       return { ok: false, error: (e && e.message) || "unknown_error" };

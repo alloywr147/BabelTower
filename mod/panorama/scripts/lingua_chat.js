@@ -15,7 +15,7 @@
   "use strict";
 
   const LOG_PREFIX = "[LCT]";
-  const VERSION = "1.0.7-6726-btipc05"; // BTIPC v1 + ⑥上层整合:出站 TRQ + 入站 chat + 保存/测试/读配置 op(btipc05)+ BTIPC 健应回声(6726 后旧通道 SetURL 导航全灭 DIAG-6726,nav 只作 >45s 无成功时的判红兜底);另修 collectPanelConfig TDZ;前版 btipc04
+  const VERSION = "1.0.7-6726-btipc05b"; // btipc05b 实车热修:op=config 读死线 8s→35s(读应答 400B=40帧×真机600ms/帧≈24s,8s必死,实车34连败根因)+ 写/测试应答瘦身 + 面板开读改用开机 mask(免24s慢读)+ op 忙等窗12s→37s(不再掉死通道);前代 btipc05:BTIPC v1 + ⑥上层整合:出站 TRQ + 入站 chat + 保存/测试/读配置 op(btipc05)+ BTIPC 健应回声(6726 后旧通道 SetURL 导航全灭 DIAG-6726,nav 只作 >45s 无成功时的判红兜底);另修 collectPanelConfig TDZ;前版 btipc04
 
   // ---- 原版聊天结构 ID(当前 Deadlock 版本稳定)----
   const CHAT_ROOT_ID = "Chat";
@@ -2312,7 +2312,12 @@ function injectTranslation(row, sig, text, fragment) {
         if (!job._btipcSince) job._btipcSince = nowMs();
         const since = job.enqueuedAt || job._btipcSince;
         const waited = job._btipcWaits || 0;
-        if (waited < 6 && nowMs() - since < 12000) {
+        // btipc05b:op 不再 12s 就放弃 —— 队头若是一次 24s 的配置读,12s 放弃会
+        // 掉进必死旧通道(panel_channel_unavailable 假失败)。op 等满 37s(读死线+缓冲);
+        // chat/outgoing 维持 12s/6 次(兜底语义不变)。
+        const busyWaits = isOp ? 74 : 6;
+        const busyMs = isOp ? 37000 : 12000;
+        if (waited < busyWaits && nowMs() - since < busyMs) {
           job._btipcWaits = waited + 1;
           State.queue.unshift(job);
           State.activeRequests = Math.max(0, State.activeRequests - 1);
@@ -2332,9 +2337,13 @@ function injectTranslation(row, sig, text, fragment) {
         if (job.op === "test") {
           payload = "op=test;tm=" + Math.max(4000, (State.cfg.timeoutMs || 15000) - 4000) + "\n" + raw;
           timeoutMs = Math.max(State.cfg.timeoutMs || 15000, 15000);
-        } else {
-          payload = "op=config\n" + raw;
-          timeoutMs = 8000;
+        // btipc05b:读/写死线分离。读应答 maskCompact ≈400B=40 帧 × 真机 600ms/帧
+        // ≈24s —— 原 8s 必超时(实车 config FAIL 34 连败的根因);写应答已瘦到
+        // {ok:true}(9B/1帧≈3s)维持 8s 快速失败。BTIPC.request 对 timeoutMs 无钳制
+        // (仅缺省时用 30s),35s 直通;40 帧常态 26s + CRC 重试/卡顿余量 < 35s。
+        const isRead = String(raw).trim() === "{}";
+        payload = "op=config\n" + raw;
+        timeoutMs = isRead ? 35000 : 8000;
         }
       } else if (isChat) {
         payload = text;
@@ -4278,15 +4287,24 @@ function injectTranslation(row, sig, text, fragment) {
       if (typeof panel.SetHasClass === "function") panel.SetHasClass(SETTINGS_VISIBLE_CLASS, true);
     } catch (e) {}
     syncPanelFromConfig();
-    // 立即用上次已知的 Key 状态回填占位符(避免每次打开先闪空;异步拉取后会再确认)
-    if ((State.cfg._providerKeys || {})[State.cfg.provider || "bing"]) {
-      setFieldText("LCTApiKey", "********");
-      credFieldSnap.apiKey = "********";
+    // btipc05b:开机读到的 mask(存 State.cfg._mask)直接秒开面板 —— 现场读应答
+    // ≈400B=40 帧 × 真机 600ms/帧 ≈24s,开面板当场读会占死 BTIPC 槽一整拍
+    // (期间点保存要排队,超 12s 还会掉死通道)。只有开机时桥不在(没同步到)
+    // 才走现场慢读兜底。
+    if (State.cfg._mask) {
+      applyConfigToPanel(State.cfg._mask);
+    } else {
+      // 从桥拉取已保存配置:回填 UI 偏好(游戏重启后恢复) + apiKey 占位符
+      bridgePost("config", {}, function (res) {
+        if (res && res.ok && res.config) {
+          State.cfg._mask = res.config;
+          applyConfigToPanel(res.config);
+        }
+      });
     }
-    // 从桥拉取已保存配置:回填 UI 偏好(游戏重启后恢复) + apiKey 占位符
-    bridgePost("config", {}, function (res) {
-      if (res && res.ok && res.config) {
-        const c = res.config;
+    // mask → 面板回填块(开机秒开与异步回填共用;函数声明提升,先用后声明合法)
+    function applyConfigToPanel(c) {
+      if (!c) return;
         if (c.ui) {
           let changed = false;
           if (typeof c.ui.displayMode === "string") { State.cfg.displayMode = c.ui.displayMode; changed = true; }
@@ -4335,8 +4353,7 @@ function injectTranslation(row, sig, text, fragment) {
           State.cfg.translateOwn = c.translateOwn;
           setToggleText("LCTTranslateOwn", State.cfg.translateOwn);
         }
-      }
-    });
+    }
     // 聚焦面板本身(与 DLCT 一致:优先控件,失败则面板;面板持焦后 Tab/Enter 可用)
     try {
       const first = findChild(panel, "LCTEnabled");
@@ -4877,6 +4894,8 @@ function injectTranslation(row, sig, text, fragment) {
             saveUiConfig();
             log("boot: config synced from bridge (outgoing=" + State.cfg.outgoing + ", translateOwn=" + State.cfg.translateOwn + ")");
           }
+          // btipc05b:留全量 mask 给面板秒开(openSettingsPanel 直接消费,免 24s 现场读)
+          State.cfg._mask = c;
           State.cfgSynced = true;
           if (callback) callback();
         } else if (attempts < MAX_SYNC_ATTEMPTS) {

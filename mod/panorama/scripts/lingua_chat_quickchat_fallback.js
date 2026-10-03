@@ -1,7 +1,7 @@
 // 自动生成 by core/quickchat.js —— 请勿手改;游戏更新后重跑 node core/quickchat.js 并重编 VPK
 // 桥离线时的快捷语音模板兜底语料(双语,来自本地真实文件)。
 // 指纹以全局变量暴露,客户端 syncQuickChat 握手用;旧兑底文件无此变量 → 客户端按指纹缺失路径处理
-LCT_QUICKCHAT_FALLBACK_FINGERPRINT = "fnv1a-bd57c0e6";
+LCT_QUICKCHAT_FALLBACK_FINGERPRINT = "fnv1a-f9ec2bc3";
 LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "攻击分路",
  "Attacking Lane",
@@ -118,7 +118,7 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "Defend Patron",
  "防守圣坛",
  "Defend Shrine",
- "防守分路",
+ "防守机甲",
  "Defend Walker",
  "别出这个",
  "Don't Buy This",
@@ -249,6 +249,7 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "Sinner's Here",
  "谁来出这个",
  "Someone Buy This",
+ "有人来过这里",
  "Someone Was Here",
  "分开推进",
  "Split Push",
@@ -415,6 +416,7 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "I'll flank 'em",
  "准备抓人",
  "Going to Gank",
+ "前往经纪商",
  "Going to The Broker",
  "去打钱了",
  "Going to farm",
@@ -452,6 +454,7 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "is almost back",
  "倒下了",
  "is dead",
+ "别管经纪商",
  "Ignore the Broker",
  "别管 {s:param_1}",
  "Ignore {s:param_1}",
@@ -569,6 +572,7 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "Sinner's Sacrifice is here",
  "谁来出 {s:param_1}",
  "Someone buy {s:param_1}",
+ "有人来过这里",
  "Someone was here",
  "我们分头推线",
  "Let's split push",
@@ -592,6 +596,7 @@ LCT_QUICKCHAT_FALLBACK_TEMPLATES = [
  "My Ultimate is ready",
  "帮忙护送灵瓮",
  "Help deliver the Urn",
+ "访问经纪商",
  "Visit the Broker",
  "访问商店",
  "Visit the shop",

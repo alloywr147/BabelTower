@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "fingerprint": "fnv1a-bd57c0e6",
+  "fingerprint": "fnv1a-f9ec2bc3",
   "langs": [
     "schinese",
     "english"
@@ -267,7 +267,7 @@
       "Push the Walker"
     ],
     "citadel_chatwheel_label_defend_walker": [
-      "防守分路",
+      "防守机甲",
       "Defend Walker"
     ],
     "citadel_chatwheel_message_defend_walker": [
@@ -525,6 +525,14 @@
     "citadel_chatwheel_message_loose_souls": [
       "这里有魂魄袋",
       "Soul bag here"
+    ],
+    "citadel_chatwheel_label_someone_was_here": [
+      "有人来过这里",
+      "Someone Was Here"
+    ],
+    "citadel_chatwheel_message_someone_was_here": [
+      "有人来过这里",
+      "Someone was here"
     ],
     "citadel_chatwheel_label_shop_closed": [
       "已关闭",
@@ -852,13 +860,25 @@
       "异化商店",
       "Corrupted Shop"
     ],
+    "citadel_chatwheel_message_going_corrupted_shop": [
+      "前往经纪商",
+      "Going to The Broker"
+    ],
     "citadel_chatwheel_label_visit_corrupted_shop": [
       "访问商店",
       "Visit Shop"
     ],
+    "citadel_chatwheel_message_visit_corrupted_shop": [
+      "访问经纪商",
+      "Visit the Broker"
+    ],
     "citadel_chatwheel_label_ignore_corrupted_shop": [
       "忽略商店",
       "Ignore Shop"
+    ],
+    "citadel_chatwheel_message_ignore_corrupted_shop": [
+      "别管经纪商",
+      "Ignore the Broker"
     ],
     "citadel_chatwheel_label_going_farm": [
       "去打钱了",
@@ -1455,26 +1475,11 @@
     "citadel_bot_objective_none": [
       "None"
     ],
-    "citadel_chatwheel_label_someone_was_here": [
-      "Someone Was Here"
-    ],
-    "citadel_chatwheel_message_someone_was_here": [
-      "Someone was here"
-    ],
     "citadel_chatwheel_label_No": [
       "No"
     ],
     "citadel_chatwheel_message_No": [
       "No"
-    ],
-    "citadel_chatwheel_message_going_corrupted_shop": [
-      "Going to The Broker"
-    ],
-    "citadel_chatwheel_message_visit_corrupted_shop": [
-      "Visit the Broker"
-    ],
-    "citadel_chatwheel_message_ignore_corrupted_shop": [
-      "Ignore the Broker"
     ],
     "ping_retreat": [
       "Pull back"

@@ -575,18 +575,61 @@ if (record.quick) {
 2. **"不翻"有三种原因,日志却长得一样**:被 `shouldSkip` 跳过、缓存命中静默注入、`State.seen` 去重 —— 三者都不打 `translated`。排查"没翻译"必须先分辨是哪一种,再谈根因。
 3. **DOM 标记的可信度是分容器的**,跨容器复用判定逻辑时必须重新论证证据强度。
 
-### 16.7 版本号口径(本轮来回改了三次,记牢)
+### 16.7 版本号口径(来回改了四次,且踩了一次跨渠道撞号,记牢)
 
 | 位置 | 含义 | 当前值 |
 |---|---|---|
-| `lingua_chat.js` 的 `const VERSION` | **当前开发版**(打进 pak,玩家日志 `loaded …` 看的就是它) | `1.0.7-6726-btipc05e` |
-| GitHub Release tag / GameBanana 版本字段 | **已发布版** | `v1.0.6` |
+| `lingua_chat.js` 的 `const VERSION` | **打进 pak 的版本串**(玩家日志 `loaded …` 看的就是它) | `1.0.7-6726-btipc05e` |
+| `VERSION` 文件 | 发布号 | `1.0.7` |
+| GitHub Release tag | **已发布版** | `v1.0.7`(@ `ac9eae1`) |
+| GameBanana 全局版本 / 文件行版本 | **已发布版** | `1.0.7` |
 | `tests/lc_btipc_guard.test.js` 断言 | 锁死 `const VERSION`,**升版必须两处同步改**,否则测试红 | `/1\.0\.7-6726-btipc\d/` |
 
-本轮三次变更的原因:
+#### 本轮真正该发的是 1.0.7,不是 1.0.6
 
-1. `a9a7308`(11:27 发布后):1.0.6 → 1.0.7 自增,进入下一开发周期 —— 这是**常态**。
-2. `cb474ab`(14:49):用户决策**覆盖 1.0.6 资产**修复 HUD bug 重发,于是把 `const VERSION` 与护栏临时对齐回 `1.0.6`,否则包自报 `v1.0.7` 而页面标 `1.0.6`,支持时对不上号。
-3. 发布完成(GitHub 两个资产 + GameBanana 文件 `babeltower-106-win64_3a4d1.zip` + GB 更新日志三处全到位)后,按「上个版本 1.0.6 → 下个 1.0.7」回到 `1.0.7`。
+**根因:版本号是跨渠道共用的,而我只查了 GitHub 一侧就下结论。**
 
-**口径纪律**:只有在"包与页面必须一致"的窗口期内才让 `const VERSION` 等于发布版;发布一结束立刻推到下一开发版。§16.5 实车日志那行是 `v1.0.7-6726-btipc05e`,因为 14:49 的 `1.0.6` 包只发了没装车。
+| 渠道 | `1.0.6` 的实际历史 |
+|---|---|
+| GameBanana | **9/25 已发布**:文件 `babeltower-106-win64_f8643.zip` + 更新条目 `458399`(该条目 Files 误绑 `babeltower-105-win64.zip`,系 `gb_add_update2.js` 老 `.find()` 挑中仍在线的 105 包所致);**`README.md` L12 一直写着「版本:1.0.6 (2026-09-25)」** |
+| GitHub | **从未发布过 `1.0.6`** —— 上一个 release 是 9/20 的 `v1.0.5` |
+
+我据 GitHub 的空缺推出"今天发 1.0.6",于是在 GB 上**重复发了一条 1.0.6**(条目 `460716`)、**删掉了 9/25 的原始 106 文件**、又把 `const VERSION` 临时对齐 `1.0.6` 再改回 `1.0.7`,反复三次。用户 10-03 指正后才查到 README 与 GB 更新列表里的铁证。
+
+纠正动作(2026-10-03 16:xx):
+
+1. **GitHub**:删 `v1.0.6` release + tag → 以 `ac9eae1` 打 `v1.0.7` → 传 `BabelTower-1.0.7-win64.zip`(36,989,614B)+ `pak01_dir.vpk`(427,866B),标 Latest。
+2. **GameBanana**:上传 `babeltower-107-win64_5d904.zip` → 行版本 + 全局版本均 `1.0.7`;条目 `460716` 改标题/版本为 1.0.7 并改绑 107 文件;条目 `458399`(9/25 那条 1.0.6)按用户决定**原样保留**。
+3. **包内 `README.md`** 由 `1.0.6 (2026-09-25)` 改为 `1.0.7 (2026-10-03)` 并重打包重传 —— **README 在 zip 里,漏改会把旧版本号发出去**。
+
+#### 口径纪律
+
+1. **发版前两个渠道的历史都要查**:`gh release list` **和** GB 的 `_aFiles` / 更新列表(`scripts/gb_files_probe.js`、`gb_updates_probe.js`)。版本号在**任一渠道**被用掉即视为已消耗。
+2. `README.md` 的版本行是**包内自报版本**,改版本必须连它一起改并重新打包,否则线上包自相矛盾。
+3. 只有在"包与页面必须一致"的窗口期内,才让 `const VERSION` 等于发布版;发布一结束立刻推到下一开发版。
+4. §16.5 实车日志那行是 `v1.0.7-6726-btipc05e`,因为当日 14:49 那次 `1.0.6` 对齐只发未装车,后已作废重发为 1.0.7。
+
+### 16.8 快捷语音 16 条红 fixture:测试数据过期,不是功能回归(2026-10-03)
+
+**判定链(按"先修真回归 → 再校正测试数据 → 最后重跑",先把回归证伪掉)**
+
+1. 红事实:`node tests/quickchat_match.test.js` → `PASS 51 / FAIL 16`,16 条**全是 `expectSkip`**。
+2. 排除本轮改动:工作区对 `lingua_chat.js` 只改注释,`core/quickchat_match.js` 与两份语料都没动 → 跑出来等价于 HEAD。
+3. 定位引入点:`git log -S` 查 `{s:param_1}不见了` / `准备就绪` / `我看到` / `还要冷却` —— 四者**都是 `2449410`(10-01 语料刷新)一次性移除**的。
+4. 回游戏本地化对账(`citadel_main_*.txt`,逐条实测而非推断):
+
+| 红 fixture | 当前 loc 实际值 | 处置 |
+|---|---|---|
+| `Venator不见了` / `McGinnis is Missing` / `Mo & Krill不见了` / `灰爪不见了` | `citadel_chatwheel_message_missing_hero` = `不见了` / `is missing`(**参数已删**) | 英雄名前缀形态游戏不再产生 → 转 `expectTrans` |
+| `我看到 McGinnis` / `I see McGinnis` | citadel_main **无 "我看到/I see" 词条** | 同上 |
+| `疗伤幽灵还要冷却1秒` / `…11秒` | `ping_ability_on_cooldown` = `{s:param_1}正在冷却` | 换现值 `疗伤幽灵正在冷却` 仍 skip |
+| `遥控夜枭准备就绪！` | `ping_ability_ready` = `{s:param_1}好了！` | 换 `遥控夜枭好了！` 仍 skip |
+| `Restorative Locket is on cooldown for 6s` | 同族现值不带 `for 6s` | 去尾仍 skip |
+| `我可以治疗你，Graves` | `can_heal` = `我可以治疗你`(**无参**) | 裸值 skip + 带名转 trans |
+
+5. 校正后全量:**13/13 全绿**,`quickchat_match` = `PASS 68 / FAIL 0`。
+
+**教训**
+
+- 语料是 `core/quickchat.js` 从游戏 loc 生成的,**游戏改值时 fixture 不会自动跟上**。红测试先分"真回归 / 测试数据过期",判据是**回本地化文件查这条 key 现在长什么样**,别一上来改匹配器。
+- `tests/quickchat_match.test.js` 里 `missing_hero 参数已被 6726 删掉` 那句,是 10-02 就察觉、一直没收的尾巴;已知疑点不闭环,就会变成下次的假红。

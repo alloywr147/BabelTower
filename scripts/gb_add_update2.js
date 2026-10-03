@@ -1,4 +1,5 @@
-// gb_add_update2.js — 发布 1.0.6 更新日志: UMM 设置联动 + 指纹丢失根治
+// gb_add_update2.js — 发布 1.0.7 更新日志: UMM 设置联动 + 指纹丢失根治
+// 2026-10-03: 1.0.6 这个号 9/25 已被 GameBanana 用掉(README L12 即证据),本脚本随之改为 1.0.7。
 // 用法: node gb_add_update2.js
 const puppeteer = require("puppeteer-core");
 const fs = require("fs");
@@ -10,18 +11,17 @@ const UPDATES_URL = "https://gamebanana.com/mods/updates/700107";
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const TITLE = "1.0.6 新功能：UMM 设置窗口联动（游戏内改设置不用再开 /tr）";
-const VERSION = "1.0.6";
+const TITLE = "1.0.7 本地桥与通信层更新：新增 BTIPC 模块，请整包升级（含 HUD 气泡修复）";
+const VERSION = "1.0.7";
 
 const CHANGELOG = [
-  ["Feature", "新增 Universal Mod Manager (UMM) 设置联动：安装 UMM 后自动出现“巴别塔”设置页，10 项常用设置（启用/服务商/目标语言/显示模式/发送前翻译/发送目标语言/强制翻译/超时/翻译自己的消息/聊天日志）可直接在游戏内 UMM 窗口调整"],
-  ["Feature", "UMM 中文界面：游戏语言为中文时 UMM 里显示中文标签；不装 UMM 完全不影响本 mod"],
-  ["Improvement", "设置同步架构：/tr 面板保存值为持久真值，UMM 改动即时生效并双向持久化；推荐装了 UMM 的用户统一用 UMM 改设置（详见 README）"],
-  ["Bugfix", "修复 quickchat 模板指纹在游戏更新触发本地化重建后丢失的问题（客户端握手告警路径永久触发的根因）"],
-  ["Note", "API Key / 区域 / 回退服务商不含在 UMM 中（机密不走广播通道），仍用 /tr 面板设置"],
+  ["Feature", "本地桥与通信层(本版主要改动):新增 core/btipc/ 四个模块,bridge_server.js 由 37,809B 增至 57,524B;出站翻译、入站聊天翻译、配置读写全部改走 BTIPC 信道,替代 6726 版本后失效的 SetURL 导航。规格 docs/btipc-v1.md 已冻结。"],
+  ["Bugfix", "必须整包解压覆盖,勿只导入 pak:游戏侧三类任务优先走 BTIPC,旧桥没有 /btipc/dl 端点会让它们超时后按原文发送,配置操作返回 ok:false。"],
+  ["Bugfix", "次要修复——HUD 顶栏气泡不挂译文:顶栏是统一模板,PingStyleIcon 等常驻槽位被递归匹配误判成快捷语音,导致译文永远挂不上;现要求 quick 有文本侧佐证才跳过,聊天/大厅行行为一字不变。"],
+  ["Feature", "沿用 1.0.6:游戏内 UMM 设置窗口出现「巴别塔」标签页,10 项常用设置直接改,即时生效并双向持久化;不装 UMM 完全不影响本 mod。"],
 ];
 
-const BLURB = "新功能：安装 Universal Mod Manager (UMM) 后，游戏内 UMM 设置窗口会自动出现“巴别塔”标签页，常用设置不用再开 /tr 面板。UMM 前置：https://gamebanana.com/mods/693642 。改动即时生效；/tr 面板仍是完整设置入口（API Key 等仍需 /tr）。含游戏内 Mod 改动，需重新下载并导入 pak（本地桥无变化，可不重装桥）。";
+const BLURB = "本版的主要改动在**本地桥与通信层**:新增 core/btipc/ 四个模块(BTIPC v1),出站翻译、入站聊天翻译、配置读写全部改走这条新信道,替代 6726 版本后失效的 SetURL 导航。因此必须整包解压覆盖、勿只导入 pak —— 只导 pak 会让翻译链路超时后按原文发送。次要修复:HUD 顶栏气泡此前因快捷语音误判而不挂译文,现已修复。安装(3 步):解压 zip → Mod Manager 导入 pak01_dir.vpk → powershell -ExecutionPolicy Bypass -File scripts\\autostart.ps1 -Action Install,然后游戏内 /tr → 测试 → 保存。详细说明见包内《安装使用说明.txt》。";
 
 async function loadCookies(page) {
   if (!fs.existsSync(COOKIES_FILE)) return;
@@ -60,6 +60,9 @@ async function setInput(page, selector, value) {
 (async () => {
   const browser = await puppeteer.launch({
     executablePath: EDGE, userDataDir: PROFILE, headless: false,
+    // 2026-10-03: 填完第 4 条 changelog 后 Runtime.callFunctionOn 默认 180s 超时,
+    // 走不到提交那步(条目未创建)。放长到 10 分钟。
+    protocolTimeout: 600000,
     args: ["--no-sandbox", "--disable-blink-features=AutomationControlled", "--ignore-certificate-errors", "--no-proxy-server"],
   });
   const page = await browser.newPage();
@@ -118,22 +121,30 @@ async function setInput(page, selector, value) {
     await sleep(500);
   }
 
+  console.log("BLURB STEP...");
   const pm = await page.$(".ProseMirror");
+  console.log("  ProseMirror found:", !!pm);
   if (pm) {
     await pm.click();
     await sleep(800);
     await page.keyboard.type(BLURB, { delay: 0 });
     await sleep(1500);
+    const blurbLen = await page.evaluate(() => {
+      const el = document.querySelector(".ProseMirror");
+      return el ? (el.innerText || "").length : -1;
+    });
+    console.log("  BLURB LEN:", blurbLen, "/", BLURB.length);
   }
 
-  // 勾选要发布的文件:严格优先 106(本版),105 只作兜底。
+  // 勾选要发布的文件:严格优先 107(本版),106/105 只作兜底。
   // 原实现 .find() 返回 DOM 中先出现者,而 babeltower-105-win64.zip 仍在列表里
-  // 且常排在 106 之前 → 会误勾 1.0.5 的包;另有已勾选状态未检查、再点会反勾的风险。
+  // 且常排在本版之前 → 会误勾 1.0.5 的包(9/25 那条 1.0.6 就是这么绑错的);
+  // 另有已勾选状态未检查、再点会反勾的风险。
   const fileChecked = await page.evaluate(() => {
     const boxes = [...document.querySelectorAll("input[type=checkbox]")];
     const labelOf = (b) => ((b.closest(".RadioCheckWrapper") || {}).innerText || "");
-    const cands = boxes.filter((b) => /babeltower-10[56]-win64/i.test(labelOf(b)));
-    const target = cands.find((b) => /babeltower-106-win64/i.test(labelOf(b))) || cands[0];
+    const cands = boxes.filter((b) => /babeltower-10[567]-win64/i.test(labelOf(b)));
+    const target = cands.find((b) => /babeltower-107-win64/i.test(labelOf(b))) || cands[0];
     if (!target) return { ok: false, total: boxes.length, cands: cands.length };
     const label = labelOf(target).replace(/\s+/g, " ").trim().slice(0, 60);
     if (!target.checked) target.click();

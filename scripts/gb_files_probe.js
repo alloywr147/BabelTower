@@ -69,6 +69,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         .map((e) => (e.innerText || "").trim())
         .filter((s) => s && s.length < 24);
       const uniqSteps = [...new Set(steps)].slice(0, 30);
+      // 文件行里的下载/详情链接(href 是验证「线上文件=本地文件」的入口)
+      const links = [...fsEl.querySelectorAll("a[href]")].map((a) => ({
+        text: (a.innerText || "").replace(/\s+/g, " ").trim().slice(0, 50),
+        href: a.getAttribute("href"),
+      }));
       return {
         totalRows: all.length,
         allRows: all,
@@ -76,6 +81,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         globalVersion: verInp ? verInp.value : null,
         hasFileInput: !!fsEl.querySelector("input[type=file]"),
         steps: uniqSteps,
+        links: links,
       };
     }, PATTERN);
 
@@ -85,6 +91,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log("STEPS:", JSON.stringify(dump.steps));
     console.log("--- MATCH [" + PATTERN + "] ---");
     dump.matchRows.forEach((r) => console.log("  * " + r));
+    console.log("--- 文件区链接 ---");
+    if (dump.links.length === 0) console.log("  (无)");
+    dump.links.forEach((l) => console.log("  " + l.href + "   |" + l.text + "|"));
     console.log("--- ALL ROWS ---");
     dump.allRows.forEach((r) => console.log("  - " + r));
   } finally {

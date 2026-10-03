@@ -27,28 +27,34 @@ qc.setCorpora(null, null); // 相同语料重灌:验证不崩 + 缓存清空(通
 resetWalkCount();
 clearMatchCache();
 
-console.log("--- 快捷语音渲染结果(应全部 skip) ---");
-expectSkip("Venator不见了");
-expectSkip("Venator不见了！");
-expectSkip("Venator不见了！！");
-expectSkip("Venator不见了！！！"); // 叠标点(HUD 实车取证形态)
-expectSkip("我看到 McGinnis");
-expectSkip("我看到 Graves");
-expectSkip("I see McGinnis");
-expectSkip("McGinnis is Missing");
-expectSkip("疗伤幽灵还要冷却1秒");
-expectSkip("疗伤幽灵还要冷却11秒");
-expectSkip("遥控夜枭准备就绪！");
-expectSkip("Restorative Locket is on cooldown for 6s");
+console.log("--- 快捷语音渲染结果:现值应 skip,已消失的旧形态应 trans ---");
+// 2026-10-03 对账 6726 后 citadel_main loc(逐条实测,与 2026-09-17 取证形态已不同):
+//   citadel_chatwheel_message_missing_hero = "不见了" / "is missing"  ← 英雄名参数已删
+//   ping_ability_ready = "{s:param_1}好了!"   ping_ability_on_cooldown = "{s:param_1}正在冷却"
+//   "我看到 / I see / 还要冷却 / 准备就绪 / for 6s" 五种旧渲染在当前 loc 中已不存在
+//   凡游戏不再产生的形态,一律按真人文本送翻译(见 §16.7 同口径:语料以游戏实际产出为准)
+expectSkip("不见了");
+expectSkip("不见了！！！");                 // 叠标点(HUD 实车取证形态;剥尾后同键)
+expectSkip("is missing");
+expectSkip("疗伤幽灵正在冷却");             // ping_ability_on_cooldown 现值
+expectSkip("Restorative Locket is on cooldown");
+expectSkip("遥控夜枭好了！");               // ping_ability_ready 现值
+expectSkip("Venator的大招好了");            // 带参数族仍在:{s:param_1}的大招好了
+expectTrans("Venator不见了");              // 旧英雄名前缀形态,游戏已不再产生
+expectTrans("Venator不见了！！！");
+expectTrans("我看到 McGinnis");             // loc 中已无 "我看到/I see" 词条
+expectTrans("I see McGinnis");
+expectTrans("McGinnis is Missing");         // missing_hero 无参后,属真人可打文本
+
 // 2026-10-02 游戏更新取证(当前 citadel_main loc + 实车 dump):
 //   路名 黄路→约克(值静态,渲染=值,零参数歧义)
 expectSkip("我们一起推约克");        // 旧:我们去推进黄路吧(ping_push_yellow 改值)
 expectSkip("防守分路！");
 expectSkip("约克需要支援！");        // 旧:黄路需要帮助！(Help_yellow 改值,语料存去尾标点)
-expectSkip("Mo & Krill不见了");          // 参数含 & 与空格(旧正则漏杀类)
-expectSkip("Lady Geist is Missing");     // 多词英文名
+expectTrans("Mo & Krill不见了");          // 与上同族:英雄名前缀形态已不再产生
+expectTrans("Lady Geist is Missing");     // 多词英文名,现属真人可打文本
 expectSkip("小 心");                     // 渲染空格不稳定
-expectSkip("灰爪不见了");                // 中文英雄名参数
+expectTrans("灰爪不见了");                // 中文英雄名前缀,同 missing_hero 无参
 
 console.log("--- 真人消息(应全部 translate) ---");
 expectTrans("撤退吧兄弟");
@@ -69,7 +75,7 @@ expectTrans("人不见了！！");
 expectTrans("小心！McGinnis有灵能涌动");
 
 console.log("--- 匹配缓存:同文本双通道只走查一次 ---");
-// 2026-10-02:输入从 "Venator不见了" 换为路名模板 —— missing_hero 参数被游戏移除待实车复核,
+// 2026-10-02:输入从 "Venator不见了" 换为路名模板 —— missing_hero 参数已被 6726 删掉(2026-10-03 对账 citadel_main loc 确认),
 // 缓存测试与该组解耦,选零参数零歧义的静态值模板(推送约克,高频轮盘)
 clearMatchCache();
 resetWalkCount();
@@ -122,7 +128,10 @@ expectSkip("推进约克");                // 2026-10-02:旧 推进黄路(路名
 expectSkip("Push York");             // 英文值曾带 </span> 残留,生成侧已剥 HTML 标签
 expectSkip("帮我护送灵瓮");
 expectSkip("Help me deliver the urn");
-expectSkip("我可以治疗你，Graves");  // can_heal 带参数,保留(非高频手打形态)
+// 2026-10-03:can_heal 现值 = "我可以治疗你"(6726 loc 已删英雄名参数),裸值仍 skip;
+// 带英雄名的旧形态不再由游戏产生 → 转真人文本
+expectSkip("我可以治疗你");
+expectTrans("我可以治疗你，Graves");
 
 console.log("--- 缓存上限:超限整体清空(正确性不受影响) ---");
 clearMatchCache();

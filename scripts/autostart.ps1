@@ -81,6 +81,8 @@ End If
   Write-Host "vbs 位置: $VbsPath"
   Write-Host ""
   Write-Host "之后直接 Steam 启动 Deadlock 即可;桥常驻,游戏开关不影响。"
+  Write-Host "前提:Deadlock 启动选项已填 -condebug(属性 → 常规 → 启动选项),"
+  Write-Host "      否则游戏不写 console.log,桥收不到上行,mod 完全不工作。"
   Write-Host "若桥意外不在(如手动杀掉): 双击 restart_bridge.bat 重启。"
   Write-Host "卸载: powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1 -Action Remove"
 } else {

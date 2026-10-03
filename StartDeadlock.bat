@@ -49,7 +49,13 @@ if not defined BRIDGE_OK (
 )
 
 echo [LCT] Bridge is up. Launching Deadlock...
-start "" "steam://rungameid/1422450"
+rem -condebug is MANDATORY: without it the game never writes
+rem game\citadel\console.log and the bridge cannot read a single [LCT]/BTIPC
+rem line back => BTIPC uplink dead => the mod silently does nothing.
+rem steam://run/<appid>//<args>/ is the supported way to pass game args
+rem (steam://rungameid/ has no argument slot). One-time alternative:
+rem Steam library -> Deadlock -> Properties -> Launch Options -> -condebug
+start "" "steam://run/1422450//-condebug"
 
 echo [LCT] Done. In game: open chat (Enter), type /tr to open settings.
 endlocal

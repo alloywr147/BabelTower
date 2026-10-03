@@ -38,7 +38,7 @@ Write-Host "==> 复制本地桥(core 递归整包)..."
 # 每次用户侧症状都是桥启动即崩且无日志(开发机 core 完整从未复现)。改为递归整包,新增文件不再漏。
 Copy-Item (Join-Path $Root "core\*") (Join-Path $Stage "core\") -Recurse -Force -Exclude "*.bak*"
 # 启动依赖断言: 递归之外的保险丝,缺任一必需文件当场 Fail
-$requiredCore = @("bridge_server.js","config.js","dictionary.js","name_protect.js","game_names.js","quickchat.js","loc_parser.js","hero_names.js")
+$requiredCore = @("bridge_server.js","config.js","dictionary.js","name_protect.js","game_names.js","quickchat.js","loc_parser.js","hero_names.js","steam_paths.js")
 foreach ($f in $requiredCore) {
   if (-not (Test-Path (Join-Path $Stage "core\$f"))) { Fail "core\$f 缺失(桥启动必需)" }
 }

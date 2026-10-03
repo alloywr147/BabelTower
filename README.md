@@ -57,7 +57,14 @@ BabelTower/
    游戏内设置窗口,调 Babel Tower 选项不用开 `/tr` 面板(见下方 [UMM 设置联动](#ummuniversal-mod-manager设置联动))
 
 4. 安装 Node.js 18+([nodejs.org](https://nodejs.org)),或使用项目自带的 `portable-node/`
-5. 一键自启(推荐,之后 Steam 直接启动游戏即可,游戏退出桥自动关闭):
+5. **必做**:给 Deadlock 加 `-condebug` 启动参数(只需设置一次) —— 游戏不带它就不会写
+   `game/citadel/console.log`,而桥只能从该文件读回游戏侧消息(BTIPC 上行的唯一通路),
+   缺了它 mod 表现为**装了完全没反应**:
+   Steam 库 → Deadlock 右键 → 属性 → 常规 → **启动选项** 填 `-condebug`
+   > 桥若检测到游戏已运行 90s 仍无本次启动的 `console.log`,会在 `logs\bridge.log` 打一条
+   > `[… ] [warn] 缺少 -condebug` 告警;用第 7 步的 `StartDeadlock.bat` 启动则自动带上该参数
+
+6. 一键自启(推荐,之后 Steam 直接启动游戏即可,游戏退出桥自动关闭):
 
 ```powershell
 # 先进入项目目录(换成你的实际路径)
@@ -68,7 +75,7 @@ powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1 -Action Install
 > 若提示找不到脚本,说明当前目录不对:先 `cd` 到项目目录,或用完整路径
 > `powershell -ExecutionPolicy Bypass -File "<你的路径>\scripts\autostart.ps1" -Action Install`
 
-6. (可选)不用自启时,双击 `StartDeadlock.bat` 手动启动
+7. (可选)不用自启时,双击 `StartDeadlock.bat` 手动启动(桥 + 游戏,自动带 `-condebug`)
 
 ## 使用
 

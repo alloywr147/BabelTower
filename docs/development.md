@@ -48,22 +48,35 @@ Bing 免 Key 与 Microsoft 双服务商均已实测,真实译文验证通过)。
 ## 2. 冒烟测试清单(首次进游戏)
 
 1. 用 `StartDeadlock.bat` 启动(或手动 `node core\bridge_server.js` 再开游戏)
-2. 看游戏日志首屏:版本串 `loaded <const VERSION>` + `boot: config synced from bridge`
+2. **确认 `-condebug` 生效**(BTIPC 上行的硬前提):`game\citadel\console.log` 开头
+   `[CommandLine]` 行应含 `-condebug`,`logs\bridge.log` 应有 `game console.log found: …`。
+   缺了它游戏不写该文件 → 桥收不到任何上行 → mod 完全不工作;
+   桥检测到游戏跑 90s 仍无本次启动的 console.log 会打 `[warn] 缺少 -condebug`。
+   `StartDeadlock.bat` 已自动带;从 Steam 界面直接启动则必须自己在
+   属性 → 常规 → 启动选项 里填 `-condebug`
+   候选路径不再写死盘符:桥按 Steam 注册表安装路径 + `libraryfolders.vdf` 里的全部库
+   自动发现(库在 D:/E:/G: 一样能找到),兜底才是老的 F: / C:\Program Files (x86) 两条;
+   全都找不到时每 60s 重扫一次
+3. 看游戏日志首屏:版本串 `loaded <const VERSION>` + `boot: config synced from bridge`
    (后者 = BTIPC 配置读通了,是"桥连上了"的可靠信号)
-3. 训练场/机器人房间打开聊天,发一条外语消息
-4. 期望:几秒内消息下方出现译文;`logs\bridge.log` 出现 `translate ok`
-5. 设置面板:`/tr` 打开 → 服务商 bing → 测试 → 保存(无需任何 Key)
+4. 训练场/机器人房间打开聊天,发一条外语消息
+5. 期望:几秒内消息下方出现译文;`logs\bridge.log` 出现 `translate ok`
+6. 设置面板:`/tr` 打开 → 服务商 bing → 测试 → 保存(无需任何 Key)
    日志应出现 `BTIPC TRQ … op=test` / `op=config`,而不是 `panel_channel_unavailable`
-6. 打字发一条本已是目标语言的短语(如 `ggwp`)→ HUD 顶栏气泡下应挂出译文
-7. 快捷语音轮盘发几条(如 `上了` / `攻击 1 级` / `谢了!`)→ 应**不**被翻译
-8. 聊天滚动(消息多到回收)后,译文应从缓存重建
-9. 打开 VConsole / Panorama 调试器,确认无 `[LCT]` 相关报错
+7. 打字发一条本已是目标语言的短语(如 `ggwp`)→ HUD 顶栏气泡下应挂出译文
+8. 快捷语音轮盘发几条(如 `上了` / `攻击 1 级` / `谢了!`)→ 应**不**被翻译
+9. 聊天滚动(消息多到回收)后,译文应从缓存重建
+10. 打开 VConsole / Panorama 调试器,确认无 `[LCT]` 相关报错
 
 > 日志噪声已处理(护栏 `tests/lc_panel_nav_guard.test.js`):旧 HTML 面板通道失效后会判死并
 > 冷却 10 分钟,冷却内不再导航、不打日志 —— `bridge nav failed: panel dead` 从每 15s 一条
 > 降为每冷却周期一条摘要(细节日志全程仅一条)。看到这条摘要**不代表桥挂了**;
 > 判断桥是否活着看 `BTIPC TRQ` / `boot: config synced`。
 > 该通道承载的 `health`/`quickchat`/`gamenames` 接口本身仍未迁 BTIPC(归 btipc07)。
+
+> `logs\` 目录不需要手工建(2026-10-03 反馈「日志目录不会自动创建」):发布包和
+> git clone 里都没有它(`.gitignore` 排除),桥写日志前会自动 `mkdir -p`,只在首次探测一次;
+> 全新解压后第一次跑就该有 `logs\bridge.log` —— 没有就说明 `config.json` 的 `logFile` 被改空了。
 
 ## 3. 构建
 

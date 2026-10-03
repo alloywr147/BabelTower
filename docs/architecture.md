@@ -83,6 +83,22 @@
 | ② | 直连 `$.AsyncWebRequest` → `/api/v1/*` | 其余桥接口(health / quickchat / gamenames / log)、①接不了时的回退 | ❌ 游戏已移除该 API,调用即抛 `AsyncWebRequest has been removed.`;探测日志 `bridge transport: AsyncWebRequest removed/unavailable` |
 | ③ | 隐藏 HTML 面板 `SetURL` → `/bridge` + `document.title` 轮询 | ②不可用时的回退 | ❌ 6726 更新后导航静默失效,日志 `bridge nav failed: panel dead (no lct-alive within 1.5s) … src=""` |
 
+- **① 的上行硬依赖 `-condebug`**:游戏→桥只能读 `game/citadel/console.log`(桥
+  `startGameLogTail()` 每秒尾随),而该文件**只在游戏带 `-condebug` 启动时**才会生成。
+  缺参 = ① 上行全断 + ②③ 本就不可用 ⇒ mod 装了完全没反应(2026-10-03 玩家反馈即此因)。
+  `StartDeadlock.bat` 用 `steam://run/1422450//-condebug` 自动带上(`steam://rungameid/`
+  没有传参位置);从 Steam 界面直接启动则必须由玩家在 属性 → 常规 → 启动选项 填一次。
+  桥侧兜底:游戏运行 90s 仍无本次启动的 `console.log` → `logs\bridge.log` 打一条
+  `[warn] 缺少 -condebug` 并给出修复步骤(每次启动只判一次)。
+- **① 的上行文件路径同样不能写死**(2026-10-03 玩家反馈「桥漏查 D 盘游戏日志」):
+  旧实现只列 `F:\SteamLibrary` 与 `C:\Program Files (x86)\Steam` 两条,Steam 库在
+  D:/E:/G: 或装在自定义路径的用户 `fs.existsSync` 永远为假 ⇒ tail 起不来,表现与
+  缺 `-condebug` 一模一样(静默不工作)。现由 `core/steam_paths.js` 统一发现:
+  `cfg.gameLogPath` / `DEADLOCK_ROOT` → Steam **注册表安装路径** →
+  `<steam>/config|steamapps/libraryfolders.vdf` 里登记的**全部库** → 老写死路径兜底;
+  没找到时每 60s 重扫一次候选(库是后来才加的也能接上)。
+  同款修法也用在 `core/game_names.js`(否则 `/gamenames` 在非标准路径下静默为空)。
+  护栏:`tests/bridge_paths_logs_guard.test.js`。
 - ① 接不了的三种情形(`payload > 680B` 的 `too_long`、目标语言不在 `[A-Za-z0-9-]` 安全字符集、
   通道忙等超过死线)会**回落 ②→③**;两条旧通道都不可用时,出站**按原文发送**、
   配置/测试操作回 `{ok:false, error}`(状态栏给出具体错误)。

@@ -7,11 +7,22 @@ const path = require("path");
 // 旧本地 parseLoc 用朴素正则 "([^"]+)"\s+"([^"]*)",值含内嵌转义引号时配对错位,
 // 后续条目被整个吞进假值静默丢 key(LEARNINGS 8-31 ⑤ 同款 bug)——由本次重构修复。
 const { parseLocFile } = require("./loc_parser.js");
+// 2026-10-03 与桥的 console.log 同款问题一并修:旧写死 F:/D:/C:\Program Files (x86)
+// 三条,库在 E:/G: 或 Steam 装在自定义路径的用户,gamenames 静默为空(翻译出来的
+// 只剩英文原名)。改走 steam_paths:注册表安装路径 → libraryfolders.vdf 全部库。
+const steamPaths = require("./steam_paths.js");
 
-// 定位 Deadlock 安装目录:优先环境变量,否则常见路径(Steam 库)
+// 定位 Deadlock 安装目录:环境变量 > Steam 注册表+全部库 > 老写死路径兜底
 function findDeadlockRoot() {
+  let discovered = [];
+  try {
+    discovered = steamPaths.gameRoots("Deadlock");
+  } catch (e) {
+    discovered = []; // 发现模块绝不能带走桥
+  }
   const candidates = [
     process.env.DEADLOCK_ROOT,
+    ...discovered,
     "F:\\SteamLibrary\\steamapps\\common\\Deadlock",
     "D:\\SteamLibrary\\steamapps\\common\\Deadlock",
     "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Deadlock",

@@ -61,7 +61,7 @@ const fs = require("fs");
 const { execFile } = require("child_process");
 // 打包/安装完整性自检: 缺任一必需内部模块立即给出可读错误并退出,
 // 避免 "Cannot find module" 原始堆栈吓用户(且现在的 uncaughtException 会把堆栈落盘)。
-for (const _m of ["./config", "./providers/registry", "./dictionary", "./name_protect", "./quickchat", "./loc_parser.js"]) {
+for (const _m of ["./config", "./providers/registry", "./dictionary", "./name_protect", "./quickchat", "./loc_parser.js", "./steam_paths.js"]) {
   try { require(_m); } catch (e) {
     console.error("[LCT] 安装不完整: 加载 " + _m + " 失败。请重新解压完整安装包,不要手动删除 core 内任何文件。");
     writeCrashLog("module-load-failed", e);
@@ -74,6 +74,8 @@ const providerRegistry = require("./providers/registry");
 const dictionary = require("./dictionary");
 const nameProtect = require("./name_protect");
 const quickchat = require("./quickchat");
+// Steam 库发现(2026-10-03 修「桥漏查 D 盘游戏日志」:不再写死两个盘符)
+const steamPaths = require("./steam_paths.js");
 // ---------- BTIPC v1(规格 docs/btipc-v1.md)----------
 // 窗口表(§6 状态机/§14.2 隔离)+ console.log tail 的 REQ/TRQ/CAN 解析(§14.1 校验,非法静默 drop 只记 WARN)。
 // 两条传输路径完全分离,共用同一套帧/窗口/重试核心:
@@ -298,6 +300,21 @@ function localTimestamp() {
     " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
 }
 
+// 日志目录自动创建(2026-10-03 修「日志目录不会自动创建」):
+// 发布包与 git clone 里都没有 logs/(.gitignore 排除),旧代码直接 appendFileSync 会被
+// ENOENT 静默吞掉 → 桥跑得起来但 logs\bridge.log 永远不存在,而 restart_bridge.ps1、
+// run-bridge.bat、排障文档全都在让用户"把 logs\bridge.log 发过来"。
+// 首次写日志补建目录;建成功后置位不再探测,免得每行日志都做一次 existsSync。
+let logDirOk = false;
+function ensureLogDir(file) {
+  if (logDirOk) return;
+  try {
+    const dir = path.dirname(file);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    logDirOk = fs.existsSync(dir);
+  } catch (e) {}
+}
+
 function log(level, msg) {
   const ts = localTimestamp();
   const line = "[" + ts + "] [" + level + "] " + msg;
@@ -305,7 +322,9 @@ function log(level, msg) {
   console.log(line);
   try {
     if (activeConfig && activeConfig.logFile) {
-      fs.appendFileSync(path.resolve(__dirname, "..", activeConfig.logFile), line + "\n", "utf8");
+      const file = path.resolve(__dirname, "..", activeConfig.logFile);
+      ensureLogDir(file);
+      fs.appendFileSync(file, line + "\n", "utf8");
     }
   } catch (e) {}
 }
@@ -1227,14 +1246,37 @@ function startGameLogTail() {
   const markers = Array.isArray(cfg.gameLogMarkers) && cfg.gameLogMarkers.length
     ? cfg.gameLogMarkers
     : ["[LCT]", "BT_"];
-  const candidates = [];
-  if (cfg.gameLogPath) candidates.push(cfg.gameLogPath);
-  candidates.push("F:/SteamLibrary/steamapps/common/Deadlock/game/citadel/console.log");
-  candidates.push("C:/Program Files (x86)/Steam/steamapps/common/Deadlock/game/citadel/console.log");
+  const GAME_LOG_REL = "game/citadel/console.log";
+  // 候选顺序:显式配置 > DEADLOCK_ROOT > Steam 注册表安装路径 + libraryfolders.vdf
+  // 登记的【全部】库(2026-10-03 修「漏查 D 盘游戏日志」:旧代码只写死 F: 与
+  // C:\Program Files (x86)\Steam 两条,库在 D:/E:/G: 或自定义 Steam 路径的用户
+  // 永远找不到文件 → tail 起不来 → BTIPC 上行全断)> 老写死路径兜底。
+  function buildCandidates() {
+    const head = [cfg.gameLogPath];
+    try {
+      if (process.env.DEADLOCK_ROOT) head.push(path.join(process.env.DEADLOCK_ROOT, GAME_LOG_REL));
+    } catch (e) {}
+    let c;
+    try {
+      c = steamPaths.gameFileCandidates("Deadlock", GAME_LOG_REL, head);
+    } catch (e) {
+      c = [];
+      (head || []).forEach(function (p) { if (p) c.push(p); });
+    }
+    // 放最后而不是最前:注册表/vdf 意外读不到时保底,又不会让残留的旧安装目录挤掉新装
+    ["F:/SteamLibrary", "D:/SteamLibrary", "C:/Program Files (x86)/Steam", "C:/Program Files/Steam"]
+      .forEach(function (lib) {
+        const p = lib + "/steamapps/common/Deadlock/" + GAME_LOG_REL;
+        if (c.indexOf(p) === -1) c.push(p);
+      });
+    return c;
+  }
 
+  let candidates = buildCandidates();
   let foundPath = null;
   let filePos = 0;
   let partial = "";
+  let probeTicks = 0;
 
   function emit(line) {
     if (line.length > 4000) line = line.slice(0, 4000) + "...<truncated>";
@@ -1244,6 +1286,10 @@ function startGameLogTail() {
   setInterval(function () {
     try {
       if (!foundPath) {
+        // 库是后来才加的 / 注册表当时读不到:没找到就每 60s 重扫一次候选,
+        // 免得启动时机不对就永远停在第一份候选上。
+        probeTicks += 1;
+        if (probeTicks % 60 === 0) candidates = buildCandidates();
         for (let i = 0; i < candidates.length; i += 1) {
           const c = candidates[i];
           try {
@@ -1293,6 +1339,35 @@ function startGameLogTail() {
       // 尾随失败不能影响桥本体
     }
   }, 1000);
+
+  // ---------- -condebug 缺失告警 ----------
+  // 游戏必须带 -condebug 启动才会写 game/citadel/console.log;没有它,BTIPC 上行
+  // (游戏→桥唯一的通路,AsyncWebRequest 已被移除、面板导航已失效)整个断掉,
+  // mod 表现为"装了完全没反应"。该参数是玩家/启动器启动项,mod 侧无法强制,
+  // 只能明确报警并给出修复步骤,免得用户对着静默失败排查一小时。
+  const CONDEBUG_WARN_MS = 90000; // 游戏起来 90s 还没有本次启动的 console.log 才判缺失
+  let condebugGameAt = 0;
+  let condebugChecked = false;
+  setInterval(function () {
+    try {
+      if (!gameProcessSeen) { condebugGameAt = 0; condebugChecked = false; return; }
+      if (condebugChecked) return;
+      const now = Date.now();
+      if (!condebugGameAt) condebugGameAt = now;
+      if (now - condebugGameAt < CONDEBUG_WARN_MS) return;
+      let fresh = false;
+      if (foundPath) {
+        try { fresh = fs.statSync(foundPath).mtimeMs >= condebugGameAt; } catch (e) { fresh = false; }
+      }
+      condebugChecked = true; // 每次游戏启动只判一次,判过就不再重复
+      if (fresh) return;
+      log("warn", "游戏已运行 " + Math.round(CONDEBUG_WARN_MS / 1000) +
+        "s,仍没有本次启动产生的 console.log => 缺少 -condebug 启动参数," +
+        "BTIPC 上行(游戏→桥)不通,mod 会完全不工作。" +
+        "修复:Steam 库 → Deadlock 右键 → 属性 → 常规 → 启动选项填 -condebug(设一次即可);" +
+        "或改用 StartDeadlock.bat 启动(已自动带 -condebug)。");
+    } catch (e) {}
+  }, 5000);
 }
 
 // 端口被占用 = 已有实例在运行,静默退出(与启动器/开机自启场景兼容)。

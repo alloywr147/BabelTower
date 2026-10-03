@@ -503,3 +503,74 @@ BTIPC: DONE win=… frames=1 bytes=6 total≈1820ms   (每 15s 一次)
 - 仿真器已打通 BTIPC 下行(`Msg` 落盘带引擎前缀 / `ImageLoaded` 捕获 / `MockPanel.SetImage` + `get id()`),38 帧配置读端到端 `END seq=37`;余下 27 FAIL 属 harness 10s 断言 vs 24s 开机读占单槽,不在官方测试清单。
 - **已知未定根因:启动首读的定时器偶发偏早**(05c 报 35000ms 却 10915ms 触发;05d 报 50000ms 却 24595ms)。仅发生在进程内第一次读,`syncBridgeConfig` 每 2s 重试自愈,后续请求死线均准确。
 - 16 红 fixture 待用户同局采样:技能冷却 → `XX正在冷却`、技能就绪 → `XX好了!`、Enemy Missing → `不见了`、Spotted → `被发现了`、轮盘 `我可以治疗你` + 未翻译整句长句原文(记时间点)。
+- `bridge nav failed: panel dead (no lct-alive within 1.5s)` 每 15s 一条,是 `op=log` 聊天日志上传走 nav 通道打不通(6726 后 `SetURL` 导航全灭)。与翻译链路无关(BTIPC 走面板字节通道),归 **btipc07 清死链**时一并处理。
+
+## 16. HUD 气泡不挂译文:`quick` 判定过宽 → btipc05e 修复 + 实车确认(2026-10-03)
+
+### 16.1 症状
+
+用户 11:31 回归实测中发现唯一真回归:**左下聊天行译文正常,顶栏 HUD 气泡行永远只有原文**。当日全量日志 `translated [hud] = 0`(仅有的 3 条 `translated` 全是聊天频道)。
+
+### 16.2 排查(逐条证伪,未跳步)
+
+| 嫌疑 | 结论 | 证据 |
+|---|---|---|
+| 配置问题 | ❌ 排除 | 用户仅改过 `targetLanguage` zh-Hans↔zh-Hant;`enabled/displayMode/translateOwn/force` 全正常 |
+| 05d 回归 | ❌ 排除 | 05d 改动只在 op 分发/死线,不碰渲染路径 |
+| 翻译管线故障 | ❌ 排除 | `!lcttest ok` 全链路走通:`TRQ b64=b2s=` → `translated [hud] <unknown>: 好` → 行被游戏回收后 `recreated translation overlay` 兜底成功 |
+| 模板匹配器误吞 | ❌ 排除 | 离线跑 `core/quickchat_match.js`(735 模板/1814 名表):`hello`/`hi`/`ok`/`gg`/`FOR THE KING RAAAAH` 全部 `TRANS`,轮盘文本全部 `SKIP` |
+| `!lcttest hello` 无 TRQ | ❌ 非故障 | L3410 **缓存命中**(11:35:58 自己发过 `hello`),静默注入属设计行为 |
+| 健康回声污染 `State.cache` | ❌ 排除 | 回声正文是 `text:"health"`(`b64=aGVhbHRo`,6 字节),不是 `hello` —— 早前误读 base64 |
+
+**排除到只剩一条**:`diag: quick row hud=1 text=hi|gg|防守分路|FOR THE KING RAAAAH` 每条 HUD 行都伴随出现,之后无下文。
+
+### 16.3 根因
+
+`shouldSkip` L1572 `if (record.quick) return true;` 无条件跳过,而 HUD 顶栏行的 `quick` 三标记(L1261-1262)用 `FindChildTraverse` **递归整棵子树**:
+
+- 聊天/大厅行的 `PingLabel` 是专用标记,可信;
+- **HUD 顶栏行是统一模板**,`PingStyleIcon`/`SubjectIcon`/`CooldownTimer`/`ResponseHeroes` 是**常驻槽位**(10-02 `exp6738` dump 实锤)—— 打字消息同样命中 `PingStyleIcon`;
+- `PingStyleIcon` 是 `e1bf714`(btipc03-05 按 10-02 dump 补)加入的,当时 dump 里 27 条 `ROW hud` **全是轮盘文本,无一条打字消息**,取证有盲区。
+
+**放大效应**:不止 L3408 直接 `return`,L3378/L3389 的**缓存恢复也被 `!skipTranslation` 拦住** → 即使缓存里已有 `hi→嗨`,HUD 行也注入不进去。即"HUD 气泡 100% 拿不到译文"。
+
+### 16.4 修复(`83696eb`,VERSION → `1.0.7-6726-btipc05e`)
+
+HUD 行的 DOM 标记须由**文本侧再确认**才跳过:
+
+```js
+if (record.quick) {
+  const textLocalized = isQuickChatTemplate(text) || (!State.cfg.force && isTargetLanguageText(text));
+  if (!record.hud || textLocalized) return true;
+  // HUD 行 + 标记存疑(既非已知轮盘语料、也不是目标语言)→ 落到下面的正常判定
+}
+```
+
+- 聊天/大厅行(`!record.hud`)→ **行为一字不变**,16/26 红 fixture 基线原样不动;
+- HUD 行 + 轮盘语料命中 → 仍跳过(`isQuickChatTemplate`);
+- HUD 行 + 中文非语料 → 仍跳过(`isTargetLanguageText`,`去商店` 这类 16/17 语料缺口由它兜住);
+- HUD 行 + 打字英文 → **放行翻译**(核心修复)。
+
+代价(已论证可接受):语料外 + 语言 ≠ 目标的窄边缘面,如 `target=en` 下的非语料中文会放行翻译 —— 而这本就是用户目标语言的正确行为。
+
+### 16.5 验证
+
+**离线**:新增 `tests/lc_hud_quick_guard.test.js` **20/0**(从客户端源码提取 `shouldSkip`/`isTargetLanguageText` 到沙箱,接真实匹配器逐条锁死);`lc_btipc_guard` 11/0、`client_copy_sync` 29/0、`quickchat_match` **51/16(基线原样)**、`quickchat_handshake` 23/0、`loc_parser` 13/0、`umm_integration` 52/0、btipc 组 crc12/frame80/simulator12/window_gc 全绿。
+
+**装车取证**:备份 `pak15_dir.vpk.bak-pre-hudquick-20261003-124220`(423995B)→ 槽位 SHA256 `9E09400E…0FBE2` == dist 源;包内 `btipc05e` / `textLocalized`×2 / `50000` / `_btipcDeferred`×5 全 FOUND。备份链三级可回滚:hudquick ← btipc05d ← btipc05c。
+
+**实车(14:03 重启)**:
+
+- `loaded v1.0.7-6726-btipc05e` ✓
+- `!lcttest hello` → `translated [hud] <unknown>: 你好` ✓(重启后缓存空,走真链路)
+- 轮盘消息 13 条(`上了`/`攻击 1 级`/`被发现了`/`谢了！` 等)全部正确跳过 ✓
+- **14:14 打字 `ggwp` → HUD 气泡下挂出「好局打得好」—— 用户肉眼确认 ✅(修复前此处 100% 空白)**
+- `dispatch THREW = 0`、真失败 0(`failed:`=23 全是 `bridge nav failed:` 假阳性)
+
+注:该次因 14:12 已翻译过 `ggwp`,L3410 缓存命中 → 无 TRQ/无 `translated` 日志,**缓存命中与被跳过在日志里长得一样**,故日志不能自证,以用户肉眼所见为准。
+
+### 16.6 教训
+
+1. **dump 取证有盲区**:10-02 的 27 条 `ROW hud` 全是轮盘文本,漏掉了"打字消息"这个关键反例 → `e1bf714` 按 dump 补标记时把常驻槽位当成了专用标记。**采样必须覆盖反例类**。
+2. **"不翻"有三种原因,日志却长得一样**:被 `shouldSkip` 跳过、缓存命中静默注入、`State.seen` 去重 —— 三者都不打 `translated`。排查"没翻译"必须先分辨是哪一种,再谈根因。
+3. **DOM 标记的可信度是分容器的**,跨容器复用判定逻辑时必须重新论证证据强度。

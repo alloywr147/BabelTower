@@ -38,9 +38,21 @@ Write-Host "==> 复制本地桥(core 递归整包)..."
 # 每次用户侧症状都是桥启动即崩且无日志(开发机 core 完整从未复现)。改为递归整包,新增文件不再漏。
 Copy-Item (Join-Path $Root "core\*") (Join-Path $Stage "core\") -Recurse -Force -Exclude "*.bak*"
 # 启动依赖断言: 递归之外的保险丝,缺任一必需文件当场 Fail
-$requiredCore = @("bridge_server.js","config.js","dictionary.js","name_protect.js","game_names.js","quickchat.js","loc_parser.js","hero_names.js","steam_paths.js")
+$requiredCore = @("bridge_server.js","config.js","dictionary.js","name_protect.js","game_names.js","quickchat.js","loc_parser.js","hero_names.js","steam_paths.js","sync_data.js")
 foreach ($f in $requiredCore) {
   if (-not (Test-Path (Join-Path $Stage "core\$f"))) { Fail "core\$f 缺失(桥启动必需)" }
+}
+
+# btipc07:桥需要客户端那一版兜底名单当"差分基线" —— 有了它,游戏更新后桥只需下发
+# 增删改(几百字节 / 半分钟),否则只能全量走 12.6 B/s 的下行通道(十几分钟)。
+# 这两个文件与打进 VPK 的完全同源,包里没有 mod/ 目录,单独补一份到 mod\panorama\scripts\。
+Write-Host "==> 复制 btipc07 同步基线..."
+New-Item -ItemType Directory -Path (Join-Path $Stage "mod\panorama\scripts") -Force | Out-Null
+$syncBaselines = @("lingua_chat_gamenames_pairs_fallback.js","lingua_chat_quickchat_fallback.js")
+foreach ($f in $syncBaselines) {
+  $src = Join-Path $Root "mod\panorama\scripts\$f"
+  if (-not (Test-Path $src)) { Fail "mod\panorama\scripts\$f 缺失(btipc07 同步基线)" }
+  Copy-Item $src (Join-Path $Stage "mod\panorama\scripts\$f")
 }
 
 Write-Host "==> 复制配置示例与脚本..."

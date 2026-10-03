@@ -306,6 +306,12 @@
     cfgSyncing: false, // 配置同步是否进行中(防 healthCheck 重复触发叠加)
     gamenamesLoaded: false, // 启动后是否已从桥拉取过游戏名保护名单(healthCheck 补触发用)
     gamenamesLoading: false, // 名单拉取是否进行中(防 healthCheck 重复触发叠加)
+    quickchatLoading: false, // 语料同步是否进行中(同上)
+    quickchatTries: 0, // btipc07:本会话语料同步已尝试次数(SYNC_MAX_TRIES 封顶)
+    gamenamesTries: 0, // btipc07:本会话名单同步已尝试次数(同上)
+    gamenamesMap: null, // btipc07:当前名单副本(delta 增量的施加基准)
+    healthDetailFetched: false, // provider/updateInfo 明细是否已补过(回声不带这些字段)
+    gamenamesFp: null, // btipc07:当前名单指纹(默认 = 打包内烘焙值,握手上报它)
     seen: new Set(), // 消息签名去重
     pendingFill: new Map(), // 6726 延迟填充观察表:rowPanel -> 过期时间戳(空行文本后补,补齐后自动出表)
     cache: new Map(), // textKey(归一化文本+目标语言) -> { translation, fragment }
@@ -1515,29 +1521,51 @@
     return out;
   }
 
+  // btipc07:语料同步改走两段式(op=config 的 get=quickchat)——
+  //   ① 握手只报兜底指纹,桥回 same=1 就一条数据都不传(常态:打包内烘焙值与桥同源);
+  //   ② 不同才按 off/lim 分片拉,收齐(done)才解析,天然免疫截断 → 不再需要
+  //      evaluateQuickChatSync 里"重拉一次确认"的那条路径(见下方 reloadTried 注释)。
   function syncQuickChat(callback) {
-    const url = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/api/v1/quickchat";
-    const doFetch = function (onDone) {
-      httpGetJson(url, function (res) { onDone(res); }, 10000);
-    };
-    const decide = function (res) {
-      // 游戏移除 $.AsyncWebRequest 后(2026-09-17 实测,1717+ 次 ERROR),该通道永久失败。
-      // 只告警一次;若重试,健康循环每 5s 重入会刷屏(曾 322+ WARN/局)。
-      if (res && res.error === "no_asyncwebrequest") {
-        if (!QC_SYNC_STATE.warnedNoTransport) {
-          QC_SYNC_STATE.warnedNoTransport = true;
-          log("WARN: quickchat 同步通道不可用($.AsyncWebRequest 已被游戏移除),永久使用兑底语料");
+    if (State.quickchatTries >= SYNC_MAX_TRIES) { if (callback) callback(); return; }
+    State.quickchatTries = (State.quickchatTries || 0) + 1;
+    syncViaBtipc(
+      "quickchat",
+      QC_LOCAL_META.fingerprint,
+      function () {
+        // 指纹一致 = 内容逐字相同,标记 synced 即可(无需 adopt,缓存本就是同一份语料)
+        quickchatSynced = true;
+        return true;
+      },
+      function (text) {
+        let data = null;
+        try { data = JSON.parse(text); } catch (e) { data = null; }
+        if (!data || typeof data !== "object") return false;
+        if (data.delta) {
+          // 增量:按增删改就地施加(目标是绝对值,重复施加幂等)
+          const removed = data.removed || [];
+          let list = QUICKCHAT_TEMPLATES.map(String).filter(function (t) { return removed.indexOf(t) < 0; });
+          const added = data.added || [];
+          for (let i = 0; i < added.length; i++) {
+            const a = String(added[i]);
+            if (list.indexOf(a) < 0) list.push(a);
+          }
+          if (!list.length) return false;
+          if (data.fingerprint) QC_LOCAL_META.fingerprint = data.fingerprint;
+          adoptQuickChatTemplates(list, "delta applied from bridge");
+          return true;
         }
-        if (callback) callback();
-        return;
-      }
-      const verdict = evaluateQuickChatSync(res, QC_LOCAL_META, QC_SYNC_STATE);
-      if (verdict.reload) { doFetch(decide); return; } // 指纹缺失/不一致:重拉一次确认后再裁决
-      if (verdict.adopt) adoptQuickChatTemplates(verdict.adopt, verdict.synced ? "synced from bridge" : "synced from bridge (fingerprint mismatch, fallback stale)");
-      if (verdict.warn) log("WARN: " + verdict.warn);
-      if (callback) callback();
-    };
-    doFetch(decide);
+        if (!Array.isArray(data.templates) || !data.templates.length) return false;
+        // 分片协议已保证收齐,不再走"重拉一次"那条分支 → 直接按首次即终局裁决
+        QC_SYNC_STATE.reloadTried = true;
+        const verdict = evaluateQuickChatSync(data, QC_LOCAL_META, QC_SYNC_STATE);
+        if (!verdict.adopt) return false;
+        adoptQuickChatTemplates(verdict.adopt, verdict.synced ? "synced from bridge" : "synced from bridge (fingerprint mismatch, fallback stale)");
+        if (data.fingerprint) QC_LOCAL_META.fingerprint = data.fingerprint;
+        if (verdict.warn) log("WARN: " + verdict.warn);
+        return true;
+      },
+      function () { if (callback) callback(); }
+    );
   }
 
   // 剥掉中文+标点/数字/空格后剩下的拉丁字母 = 消息里真正非中文的部分
@@ -1883,8 +1911,10 @@ function injectTranslation(row, sig, text, fragment) {
     pumpQueue();
   }
 
-  function enqueueBridge(op, data, done) {
-    State.queue.push({ kind: "bridge", op: op, data: data, row: null, sig: null, attempts: 0, done: done });
+  function enqueueBridge(op, data, done, isRead) {
+    // read:btipc07 的 get 请求应答可能比分片还大(全量语料),必须走 50s 读死线
+    // 而不是写死线 8s,否则首发起跑竞态一烧就超时(同 op=config 读的老坑)。
+    State.queue.push({ kind: "bridge", op: op, data: data, row: null, sig: null, attempts: 0, done: done, read: !!isRead });
     pumpQueue();
   }
 
@@ -2403,7 +2433,7 @@ function injectTranslation(row, sig, text, fragment) {
           // 会白烧 5~6 轮 ×2.5s(STORM 罚时),再叠加中途 CRC 重试,35s 余量仅 4.8s,
           // 实测约 1/3 概率超时 → 白等 35s 再重试。50s 覆盖「竞态 15s + 38 帧 23s +
           // 中途 2 次 STORM 5s」≈43s 的最坏情形。写仍 8s(1 帧,无帧竞态问题)。
-          const isRead = String(raw).trim() === "{}";
+          const isRead = !!job.read || String(raw).trim() === "{}";
           payload = "op=config\n" + raw;
           timeoutMs = isRead ? 50000 : 8000;
         }
@@ -3248,6 +3278,59 @@ function injectTranslation(row, sig, text, fragment) {
 
   // ---- 桥健康探测(定时 ping,断线后状态栏提示 + 恢复后自动清错) ----
   // 注意:health 与翻译共用串行队列;队列忙时跳过本次 ping,避免 health 阻塞发消息/测试
+
+  // btipc07:上线判定从 healthCheck 的 HTTP 回调里抽出来,BTIPC 回声成功即视为在线。
+  // 老毛病:回声成功只 update btipcLastOk 就 return —— 状态栏永远停在初始值,
+  // 而 gamenames / quickchat / cfgSynced 三个触发器挂在必死的 bridgePost("health") 上,
+  // 一次都没执行过(名称保护一直停在硬编码 100 条,语料从不跟游戏更新)。
+  function onBridgeAlive(src) {
+    if (!State.bridgeUp) log("bridge online (" + src + ")");
+    State.bridgeUp = true;
+    State.bridgeOfflineSince = 0;
+    setBridgeStatus(t("bridgeOnline") + " \u00b7 " + (State.cfg.provider || "bing"));
+    if (!State.cfgSynced && !State.cfgSyncing) {
+      State.cfgSyncing = true;
+      syncBridgeConfig(function () { State.cfgSyncing = false; });
+    }
+    // 首次上线:名称保护全量名单 + 快捷语音语料(两段式握手,指纹相同则一条数据都不传)
+    if (!State.gamenamesLoaded && !State.gamenamesLoading) {
+      State.gamenamesLoading = true;
+      syncGameNames(function () { State.gamenamesLoading = false; });
+    }
+    if (!quickchatSynced && !State.quickchatLoading) {
+      State.quickchatLoading = true;
+      syncQuickChat(function () { State.quickchatLoading = false; });
+    }
+    // provider / 版本更新提示:回声只证明桥活着,带不了这些字段 —— 每会话补一次
+    // (先置位防重入;失败则复位,下一轮 healthCheck 再补)
+    if (!State.healthDetailFetched) {
+      State.healthDetailFetched = true;
+      bridgePost("health", {}, function (res) {
+        if (!res || !res.ok) { State.healthDetailFetched = false; return; }
+        if (res.provider) setBridgeStatus(t("bridgeOnline") + " \u00b7 " + res.provider);
+        if (res.updateInfo && res.updateInfo.hasUpdate && !State.updateNotified) {
+          State.updateNotified = true;
+          const info = res.updateInfo;
+          State.updateMsg = t("updateAvailable") + info.latestVersion + " \u00b7 " + t("updateHint");
+          log("info", "update available: " + info.currentVersion + " -> " + info.latestVersion + " (" + info.releaseUrl + ")");
+          updateBridgeStatusUI();
+        }
+      });
+    }
+  }
+
+  // 判红前给一段宽限:开设置面板 / 切 UI 时的几秒瞬断不算掉线
+  function onBridgeDown() {
+    if (!State.bridgeOfflineSince) {
+      State.bridgeOfflineSince = nowMs();
+      log("bridge offline (health): grace started");
+    } else if (nowMs() - State.bridgeOfflineSince > BRIDGE_OFFLINE_GRACE_SECONDS * 1000) {
+      State.bridgeUp = false;
+      setStatus(t("bridgeOffline"));
+      setBridgeStatus(t("bridgeOffline"));
+    }
+  }
+
     function healthCheck() {
     if (State.queue.length > 0 || State.pending) return;
     // btipc04:BTIPC 健康新鲜期(45s 内有成功)用 REQ 回声(15s/次)替代必死的 nav health;
@@ -3261,11 +3344,18 @@ function injectTranslation(row, sig, text, fragment) {
         if (echoDue) {
           State.btipcLastEcho = nowH;
           BTIPC.request({ windowId: BTIPC.newWindowId(), text: "health", translate: false, timeoutMs: 8000 })
-            .catch(function (err) { log("btipc health echo FAIL kind=" + ((err && err.kind) || "unknown")); });
+            .then(function () { onBridgeAlive("btipc echo"); })
+            .catch(function (err) {
+              log("btipc health echo FAIL kind=" + ((err && err.kind) || "unknown"));
+              onBridgeDown();
+            });
           return;
         }
       }
-      if (freshH) return; // 新鲜期(含忙时)不打必死的 nav
+      // 传输在途(同步分片 / op 读)说明桥正在回帧,不能判死;新鲜期同理
+      if (freshH || State.btipcActive) return;
+      onBridgeDown();
+      return;
     }
     // long offline + panel-only channel -> reset to re-probe direct (works if game supports AsyncWebRequest)
     // 限流:复位会立刻被下一次 detectAsyncWebRequest 打回 false,不加间隔就会每 5s 刷一条复位日志。
@@ -3274,42 +3364,11 @@ function injectTranslation(row, sig, text, fragment) {
       State.canHttp = null;
       log("bridge channel: reset to re-probe direct (was panel-only)");
     }
+    // 兜底分支:BTIPC 不可用时才落到这里(6726 后该通道已死,留着只为不改变语义)。
+    // btipc07 之后 health 也是 op=config 的 get=,走 BTIPC;上下线判定统一在上面两个函数里。
     bridgePost("health", {}, function (res) {
-      if (res && res.ok) {
-        if (!State.bridgeUp) log("bridge online (health)");
-        State.bridgeUp = true;
-        State.bridgeOfflineSince = 0;
-        setBridgeStatus(t("bridgeOnline") + " \u00b7 " + (res.provider || State.cfg.provider || "bing"));
-        // 版本更新提示:health 响应带 updateInfo 时在状态栏显示一次
-        if (res.updateInfo && res.updateInfo.hasUpdate && !State.updateNotified) {
-          State.updateNotified = true;
-          const info = res.updateInfo;
-          State.updateMsg = t("updateAvailable") + info.latestVersion + " \u00b7 " + t("updateHint");
-          log("info", "update available: " + info.currentVersion + " -> " + info.latestVersion + " (" + info.releaseUrl + ")");
-          updateBridgeStatusUI();
-        }
-        if (!State.cfgSynced && !State.cfgSyncing) {
-          State.cfgSyncing = true;
-          syncBridgeConfig(function () { State.cfgSyncing = false; });
-        }
-        // 首次上线:从桥拉取游戏名保护名单(全量,消除硬编码兜底名单漂移)
-        if (!State.gamenamesLoaded && !State.gamenamesLoading) {
-          State.gamenamesLoading = true;
-          syncGameNames(function () { State.gamenamesLoading = false; });
-        }
-        if (!quickchatSynced) syncQuickChat();
-      } else {
-        // offline grace: only mark red after BRIDGE_OFFLINE_GRACE_SECONDS of continuous failure,
-        // absorbing the few-second LCTBridgePanel-unreachable blip when opening settings / switching UI
-        if (!State.bridgeOfflineSince) {
-          State.bridgeOfflineSince = nowMs();
-          log("bridge offline (health): grace started");
-        } else if (nowMs() - State.bridgeOfflineSince > BRIDGE_OFFLINE_GRACE_SECONDS * 1000) {
-          State.bridgeUp = false;
-          setStatus(t("bridgeOffline"));
-          setBridgeStatus(t("bridgeOffline"));
-        }
-      }
+      if (res && res.ok) onBridgeAlive("legacy health");
+      else onBridgeDown();
     });
   }
 
@@ -4816,8 +4875,16 @@ function injectTranslation(row, sig, text, fragment) {
     return out;
   }
 
+  // btipc07:health / gamenames / quickchat 三接口迁 BTIPC。TRQ 信封白名单冻结
+  // (core/btipc/transport.js 只认 op=config|test),所以新语义一律塞进 op=config 的
+  // JSON body 的 "get" 字段,由桥端 runBtipcGet 解释 —— 信封/帧/状态机零改动,
+  // 上层(healthCheck / syncGameNames / syncQuickChat)的调用方式也完全不变。
+  const BTIPC_GET_OPS = { health: 1, gamenames: 1, quickchat: 1 };
+
   function bridgePost(op, payload, done) {
-    const data = encodeURIComponent(JSON.stringify(payload || {}));
+    const isGet = !!BTIPC_GET_OPS[op];
+    const body = isGet ? Object.assign({ get: op }, payload || {}) : (payload || {});
+    const data = encodeURIComponent(JSON.stringify(body));
     // 直连通道可用时不要求 HTML 面板存在(hudchat 未加载时测试/保存也能用)
     const canHttp = detectAsyncWebRequest();
     const panel = canHttp ? null : ensurePanel();
@@ -4826,7 +4893,7 @@ function injectTranslation(row, sig, text, fragment) {
       return;
     }
     ensureBridgeEvents();
-    enqueueBridge(op, data, done);
+    enqueueBridge(isGet ? "config" : op, data, done, isGet);
   }
 
   function LCTSave() {
@@ -4991,38 +5058,129 @@ function injectTranslation(row, sig, text, fragment) {
     trySync();
   }
 
-  // 从桥拉取游戏名保护名单(/api/v1/gamenames)。
-  // 成功则用全量名单(原始大小写)覆盖硬编码兜底 PROTECT_NAMES / PROTECT_TO_ZH 并重建正则;
-  // 失败则保留现有兜底名单(不覆盖),并有限重试。
-  function syncGameNames(callback) {
-    let attempts = 0;
-    const MAX_ATTEMPTS = 10;
-    const trySync = function () {
-      attempts += 1;
-      const url = "http://" + BRIDGE_HOST + ":" + BRIDGE_PORT + "/api/v1/gamenames";
-      httpGetJson(url, function (res) {
-        if (res && res.ok && res.names && typeof res.names === "object" && Object.keys(res.names).length > 0) {
-          // 桥名单含一个 "english" -> "schinese" 元字段,过滤掉(非游戏名)
-          const map = {};
-          for (const en of Object.keys(res.names)) {
-            if (en === "english" || en === "schinese") continue;
-            map[en] = res.names[en];
-          }
-          if (rebuildGameNames(map)) {
-            State.gamenamesLoaded = true;
-            if (callback) callback();
-            return;
-          }
-        }
-        // 失败/名单为空:未成功则不覆盖兜底;有限重试
-        if (!State.gamenamesLoaded && attempts < MAX_ATTEMPTS) {
-          $.Schedule(3.0, trySync);
-        } else {
-          if (callback) callback();
-        }
-      }, 10000);
+  // ================= btipc07:数据同步两段式(health/gamenames/quickchat) =================
+  // 下行只有 ~12.6 B/s(docs/btipc-v1.md §9:16B/帧 × 0.79s/帧),9.5KB/39KB 全量同步
+  // 物理不可行(14~46 分钟),所以:
+  //   ① 握手只报指纹 —— 桥相同就回 same=1,一条数据都不传(常态:打包内烘焙值与桥同源);
+  //   ② 不同才分片,片长按【字节】限(90B ≈ 8 帧 ≈ 7s + 3.5s 固定开销 ≈ 11s/片),
+  //      低于出站 15s 丢弃线;片间等队列空再拉,翻译优先(单槽队列,不让位会卡死翻译);
+  //   ③ 桥能读到客户端那版兜底时给的是 delta(增删改),通常 1~2 片 ≈ 半分钟。
+  const SYNC_LIM_BYTES = 90;
+  const SYNC_MAX_CHUNKS = 400; // 护栏:90B × 400 = 36KB,够两份语料全量还有余量
+  const SYNC_MAX_TRIES = 3; // 每会话最多重试次数(避免桥一直回错时每 15s 刷一条失败日志)
+
+  /**
+   * 两段式取数。
+   * @param {string}   op        bridgePost 的 op 名(gamenames / quickchat)
+   * @param {string}   localFp   本地指纹(握手第一发)
+   * @param {function} onSame    指纹一致时调用(标记 synced),返回是否算成功
+   * @param {function} onApply   收到完整载荷时调用 (text, res) -> bool
+   * @param {function} callback  (ok) 收尾
+   */
+  function syncViaBtipc(op, localFp, onSame, onApply, callback) {
+    const fail = function (why) {
+      log(op + " sync failed: " + why);
+      if (callback) callback(false);
     };
-    trySync();
+    const pull = function (off, acc, chunks, exp) {
+      if (chunks > SYNC_MAX_CHUNKS) { fail("budget exceeded at " + chunks + " chunks"); return; }
+      // fp 恒为【客户端本地指纹】(握手与分片一致,桥才能每次算出同一份载荷);
+      // exp 是握手时桥回的指纹,用于让桥发现"拉到一半配置被重建"。
+      const body = { fp: localFp || "" };
+      if (off !== null) { body.off = off; body.lim = SYNC_LIM_BYTES; if (exp) body.exp = exp; }
+      bridgePost(op, body, function (res) {
+        if (!res || !res.ok) { fail((res && res.error) || "bridge_error"); return; }
+        if (res.same) { if (callback) callback(onSame(res) !== false); return; }
+        if (off === null) {
+          // 握手回包:拿到桥侧指纹后才开拉
+          if (!res.fingerprint) { fail("bad_handshake"); return; }
+          pull(0, "", 1, res.fingerprint);
+          return;
+        }
+        if (typeof res.part !== "string") { fail("bad_chunk"); return; }
+        const next = acc + res.part;
+        const nextOff = (Number(res.off) || 0) + res.part.length;
+        if (res.done) {
+          if (!next) { fail("empty_payload"); return; }
+          if (callback) callback(onApply(next, res) !== false);
+          return;
+        }
+        // 让位:队列里还有活就等它做完(翻译优先),再拉下一片
+        const again = function () {
+          if (State.queue.length > 0 || State.activeRequests > 0) { $.Schedule(1.0, again); return; }
+          pull(nextOff, next, chunks + 1, exp);
+        };
+        $.Schedule(0.3, again);
+      });
+    };
+    pull(null, "", 0, null);
+  }
+
+  // 应用名单载荷:delta 就地增删改,全量整体替换。重建失败保留旧名单(不覆盖)。
+  function applyNamesPayload(text, res) {
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) { data = null; }
+    if (!data || typeof data !== "object") { log("gamenames sync: payload not JSON"); return false; }
+    let map = null;
+    if (data.delta) {
+      const base = State.gamenamesMap && typeof State.gamenamesMap === "object" ? State.gamenamesMap : {};
+      map = {};
+      for (const k of Object.keys(base)) map[k] = base[k];
+      const add = data.added || {};
+      for (const k of Object.keys(add)) map[k] = add[k];
+      const chg = data.changed || {};
+      for (const k of Object.keys(chg)) map[k] = chg[k];
+      for (const k of (data.removed || [])) delete map[k];
+    } else if (data.names && typeof data.names === "object") {
+      map = {};
+      for (const k of Object.keys(data.names)) {
+        if (k === "english" || k === "schinese") continue; // 元字段,非游戏名
+        map[k] = data.names[k];
+      }
+    }
+    if (!map || Object.keys(map).length === 0) { log("gamenames sync: empty payload"); return false; }
+    if (!rebuildGameNames(map)) return false;
+    State.gamenamesMap = map;
+    State.gamenamesFp = data.fingerprint || res.fingerprint || State.gamenamesFp;
+    log("gamenames sync applied: " + Object.keys(map).length + " entries via " + (data.delta ? "delta" : "full"));
+    return true;
+  }
+
+  // btipc07:启动即装打包内烘焙的全量配对名单。相对硬编码 100 条的好处:
+  //   ① 覆盖面翻倍(292 条,来自本机游戏本地化,随 mod 一起发布);
+  //   ② 随文件烘焙了指纹 LCT_GAMENAMES_PAIRS_FP —— 桥端握手能 1 帧判定"要不要传",
+  //      否则硬编码那 100 条根本没有指纹,每局都会被判不一致、白传一次名单。
+  function initBakedGameNames() {
+    try {
+      if (typeof LCT_GAMENAMES_PAIRS === "undefined" || !LCT_GAMENAMES_PAIRS) return;
+      const baked = LCT_GAMENAMES_PAIRS;
+      if (!rebuildGameNames(baked)) return;
+      State.gamenamesMap = baked;
+      if (typeof LCT_GAMENAMES_PAIRS_FP === "string" && LCT_GAMENAMES_PAIRS_FP) {
+        State.gamenamesFp = LCT_GAMENAMES_PAIRS_FP;
+      }
+      log("game names: baked pairs loaded (" + Object.keys(baked).length + ", fp=" + State.gamenamesFp + ")");
+    } catch (e) {
+      log("game names: baked pairs init THREW " + expErr(e));
+    }
+  }
+
+  // 从桥拉取游戏名保护名单(op=config 的 get=gamenames)。
+  // 成功则用全量名单(原始大小写)覆盖硬编码兜底 PROTECT_NAMES / PROTECT_TO_ZH 并重建正则;
+  // 失败则保留现有名单(不覆盖),有限重试。
+  function syncGameNames(callback) {
+    if (State.gamenamesTries >= SYNC_MAX_TRIES) { if (callback) callback(); return; }
+    State.gamenamesTries = (State.gamenamesTries || 0) + 1;
+    syncViaBtipc(
+      "gamenames",
+      State.gamenamesFp,
+      function () { return true; },
+      applyNamesPayload,
+      function (ok) {
+        if (ok) State.gamenamesLoaded = true;
+        if (callback) callback();
+      }
+    );
   }
 
   // ============= EXP6727: Panorama IPC 检查表探针(检查表: 新建 文本文档.txt A~E/I) =============
@@ -6893,6 +7051,7 @@ function injectTranslation(row, sig, text, fragment) {
     applyUILang(); // 初始化界面语言
     ensureBridgeEvents(); // 尽早注册 HTML 面板事件(读回主通道)
     registerUmmSettings(); // UMM 设置联动(UMM 不在时为无害空操作,见 ummCurrentValues 注释)
+    initBakedGameNames(); // btipc07:先装打包内烘焙的全量配对名单(292 条,硬编码只有 100 条)
     syncBridgeConfig(); // BUGFIX 0.1.3:启动即同步桥配置,发送前翻译不再需要先开一次设置面板
     applyUILang(); // 初始化界面语言(配置同步后应用)
     updateBridgeDot(); // 初始状态:桥未上线前显示红点

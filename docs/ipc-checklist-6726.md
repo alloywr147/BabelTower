@@ -633,3 +633,59 @@ if (record.quick) {
 
 - 语料是 `core/quickchat.js` 从游戏 loc 生成的,**游戏改值时 fixture 不会自动跟上**。红测试先分"真回归 / 测试数据过期",判据是**回本地化文件查这条 key 现在长什么样**,别一上来改匹配器。
 - `tests/quickchat_match.test.js` 里 `missing_hero 参数已被 6726 删掉` 那句,是 10-02 就察觉、一直没收的尾巴;已知疑点不闭环,就会变成下次的假红。
+
+## 17. btipc07 — health / gamenames / quickchat 迁 BTIPC(2026-10-04)
+
+设计与验收清单见 **`docs/ipc-btipc07.md`**;本节只记决策链与"为什么不能直接搬 HTTP handler"。
+
+### 17.1 三个同步触发器从没执行过的根因(非猜测,逐条回代码)
+
+1. `$.AsyncWebRequest` 6726 后**调用即同步抛**(census 实证),`httpGetJson` 一次都回不来;
+2. `healthCheck` 的 BTIPC 回声成功只 `update btipcLastOk` 就 `return` —— `setBridgeStatus`、
+   `syncGameNames`、`syncQuickChat`、配置同步**全写在必死的 `bridgePost("health")` 回调里**;
+3. 因此状态栏永停初始值、名单永是硬编码 100 条、语料永不同步。**不是"逻辑写错",是"逻辑挂在了死通道后面"。**
+
+### 17.2 为什么不能开新 op 名(信封冻结的实证)
+
+TRQ 白名单 `core/btipc/transport.js` L128 = `op=(?:config|test)`,新增 `op=health`/`op=gamenames`
+会被 `parseTrqEnvelope` 直接判 `id_format` 类拒绝。`core/btipc/*` 又是冻结面 → 新语义只能进
+`op=config` 的 **JSON body 新增 `"get"` 字段**,解释权留在 `core/bridge_server.js`,帧格式/状态机/窗口零改动。
+
+### 17.3 物理约束 → 三段策略
+
+下行 **16B/帧 × 0.79s/帧 ≈ 12.6 B/s**(§9 实测)。体量实测:gamenames 全量 8 052B、
+quickchat 全量 13 536B → 全量 107~151 片 ≈ **18~25 分钟**。所以:
+
+| 段 | 触发 | 实测量级 |
+|---|---|---|
+| ① 握手 `{fp}` | 每会话一次 | 指纹相同 → `same=true, total=0`,**零传输**(打包基线与配置同源) |
+| ② delta | 桥读得到客户端基线 | gamenames **144B / 3 片 ≈33s**;quickchat **115B / 2 片 ≈22s** |
+| ③ full | 基线缺失(老包) | 107~151 片,有 `SYNC_MAX_CHUNKS` + `SYNC_MAX_TRIES` 护栏 |
+
+**决策:不做 gzip/base64**(delta 才是常态路径,gzip 只对稀有的 full 有收益;游戏侧不能离线验证的
+解码器是纯风险)。载荷是纯 JSON 文本,`sliceByJsonBytes` 按 **JSON 编码后的字节数**二分切片
+(中文 3B/字符 + 二次转义会翻倍),保证单片 ≤ `lim`,游戏侧 `SYNC_LIM_BYTES = 90` < 出站 15s 丢弃线。
+
+### 17.4 三个"不自洽就会静默出错"的约定(已写进护栏测试)
+
+- `fp` **恒为客户端本地指纹**(握手与分片一致),否则桥第二次 `encodeFor` 会退化成 full,和握手的 `total` 对不上;
+- `exp` = 握手时桥回的指纹,分片原样回传 → 桥发现"拉到一半配置被重建"回 `fp_changed`;
+- `off` 用 `undefined/null` 判握手,**不能用 falsy**(0 是合法偏移)。
+
+### 17.5 打包铁律(老坑重现的预防)
+
+`package_release.ps1` **不带 `mod/`** → 玩家侧桥读不到基线 → 永远走 full(十几分钟)。
+已补:随包带 `lingua_chat_gamenames_pairs_fallback.js` + `lingua_chat_quickchat_fallback.js`
+到 `mod\panorama\scripts\`,缺任一 `Fail`;`sync_data.js` 进 `$requiredCore`(缺文件桥起不来会当场炸)。
+
+### 17.6 测试
+
+- `tests/btipc07_sync.test.js` **38 PASS**:指纹同源对拍(`core/quickchat.js` vs `sync_data.js` 内联版)、
+  握手 same/full、delta 往返+幂等、`fp_changed`、`off=0`、`lim 4..200` 分片预算、缓存一致性;
+- `tests/lc_btipc07_guard.test.js` **53 PASS**:信封折叠、health 触发链、分片让位、打包基线、冻结面未动;
+- 全量 **19/19 文件全绿**。
+
+### 17.7 待实车验收
+
+见 `docs/ipc-btipc07.md` §8(六条)。**本轮未提交前不装车**;装车仍走槽位铁律
+(`local-d0264ee4-f10d-4faf-8ebc-7ace2f340612` → `pak15_dir.vpk`,先备份,游戏运行中禁装)。

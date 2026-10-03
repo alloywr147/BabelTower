@@ -11,6 +11,9 @@ const { parseLocFile } = require("./loc_parser.js");
 // 三条,库在 E:/G: 或 Steam 装在自定义路径的用户,gamenames 静默为空(翻译出来的
 // 只剩英文原名)。改走 steam_paths:注册表安装路径 → libraryfolders.vdf 全部库。
 const steamPaths = require("./steam_paths.js");
+// btipc07:客户端兜底名单的指纹要与桥端同源(sync_data 只依赖 zlib,不会与
+// quickchat → game_names 形成循环依赖)
+const syncData = require("./sync_data.js");
 
 // 定位 Deadlock 安装目录:环境变量 > Steam 注册表+全部库 > 老写死路径兜底
 function findDeadlockRoot() {
@@ -69,15 +72,36 @@ function build() {
   return { ok: true, count: Object.keys(map).length, map };
 }
 
-module.exports = { build, findDeadlockRoot, cleanZh };
+// 烘焙客户端兜底:btipc07 要做「指纹协商」,游戏侧必须自带一份桥认得的名单,
+// 否则每次开局都要花 10+ 分钟把 292 条名字过一遍 12.6 B/s 的下行通道。
+// 本文件与 config/gamenames.json 同源同批生成 → 指纹相同 → 握手 1 帧秒回 same。
+function writeClientFallback(map, outPath) {
+  const pairs = {};
+  const keys = Object.keys(map || {}).filter((k) => k !== "english" && k !== "schinese").sort();
+  for (const k of keys) pairs[k] = String(map[k]);
+  const fp = syncData.namesFingerprint(pairs);
+  const out = outPath || path.join(__dirname, "..", "mod", "panorama", "scripts", "lingua_chat_gamenames_pairs_fallback.js");
+  const body =
+    "// 自动生成 by core/game_names.js —— 请勿手改;游戏更新后重跑 node core/game_names.js 并重编 VPK\n" +
+    "// 名称保护兜底名单(英文原名 -> 中文译名),桥离线时用;指纹供 btipc07 握手比对,\n" +
+    "// 指纹相同 = 游戏侧这份与桥一致 → 一条数据都不用传。\n" +
+    "LCT_GAMENAMES_PAIRS_FP = " + JSON.stringify(fp) + ";\n" +
+    "LCT_GAMENAMES_PAIRS = " + JSON.stringify(pairs, null, 1) + ";\n";
+  fs.writeFileSync(out, body, "utf8");
+  return { path: out, fingerprint: fp, count: keys.length };
+}
 
-// 直接运行:生成并落盘 config/gamenames.json(桥侧缓存,也可能打进 VPK)
+module.exports = { build, findDeadlockRoot, cleanZh, writeClientFallback };
+
+// 直接运行:生成并落盘 config/gamenames.json(桥侧缓存)+ 客户端兜底名单
 if (require.main === module) {
   const r = build();
   if (!r.ok) { console.error("BUILD FAIL:", r.error); process.exit(1); }
   const out = path.join(__dirname, "..", "config", "gamenames.json");
   fs.writeFileSync(out, JSON.stringify(r.map, null, 2) + "\n", "utf8");
   console.log("wrote", out, "entries:", r.count);
+  const fb = writeClientFallback(r.map);
+  console.log("wrote", fb.path, "entries:", fb.count, "fingerprint:", fb.fingerprint);
   // 抽样验证
   for (const k of ["Holliday", "Hollow Point", "Abrams", "Infernus", "Lady Geist"]) {
     console.log(k, "->", r.map[k] || "(missing)");

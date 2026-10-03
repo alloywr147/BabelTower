@@ -61,7 +61,7 @@ const fs = require("fs");
 const { execFile } = require("child_process");
 // 打包/安装完整性自检: 缺任一必需内部模块立即给出可读错误并退出,
 // 避免 "Cannot find module" 原始堆栈吓用户(且现在的 uncaughtException 会把堆栈落盘)。
-for (const _m of ["./config", "./providers/registry", "./dictionary", "./name_protect", "./quickchat", "./loc_parser.js", "./steam_paths.js"]) {
+for (const _m of ["./config", "./providers/registry", "./dictionary", "./name_protect", "./quickchat", "./loc_parser.js", "./steam_paths.js", "./sync_data.js"]) {
   try { require(_m); } catch (e) {
     console.error("[LCT] 安装不完整: 加载 " + _m + " 失败。请重新解压完整安装包,不要手动删除 core 内任何文件。");
     writeCrashLog("module-load-failed", e);
@@ -76,6 +76,8 @@ const nameProtect = require("./name_protect");
 const quickchat = require("./quickchat");
 // Steam 库发现(2026-10-03 修「桥漏查 D 盘游戏日志」:不再写死两个盘符)
 const steamPaths = require("./steam_paths.js");
+// btipc07:health / gamenames / quickchat 的载荷编码(指纹协商 + gzip 分片 + delta)
+const syncData = require("./sync_data.js");
 // ---------- BTIPC v1(规格 docs/btipc-v1.md)----------
 // 窗口表(§6 状态机/§14.2 隔离)+ console.log tail 的 REQ/TRQ/CAN 解析(§14.1 校验,非法静默 drop 只记 WARN)。
 // 两条传输路径完全分离,共用同一套帧/窗口/重试核心:
@@ -115,6 +117,66 @@ function onBtipcGameLine(line) {
   }
 }
 
+// ---------- btipc07:health / gamenames / quickchat(op=config 的 JSON body "get" 字段)----------
+// 为什么复用 op=config:TRQ 信封白名单冻结(core/btipc/transport.js 只认 config|test),
+// 动信封 = 动协议;body 语义由桥端解释,信封层/帧格式/状态机零改动。
+// 下行只有 ~12.6 B/s → 先握手(指纹),相同 1 帧级秒回;不同才分片,能走 delta 就不走全量。
+// 编码/指纹/delta/切片全在 core/sync_data.js(纯函数,tests/btipc07_sync.test.js 对拍)。
+const SYNC_KINDS = {
+  gamenames: { cfg: "gamenames.json", fallback: "lingua_chat_gamenames_pairs_fallback.js", name: "LCT_GAMENAMES_PAIRS" },
+  quickchat: { cfg: "quickchat.json", fallback: "lingua_chat_quickchat_fallback.js", name: "LCT_QUICKCHAT_FALLBACK_TEMPLATES" },
+};
+
+function readSyncConfig(kind) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, "..", "config", SYNC_KINDS[kind].cfg), "utf8"));
+  } catch (e) {
+    return null;
+  }
+}
+
+// 读客户端那一版兜底:发布包里单独带了一份 mod\panorama\scripts\*_fallback.js
+// (package_release.ps1 补的),桥据此知道客户端手上是什么 → 把「全量」降级成「增删改」。
+// 读不到(老包 / 手工部署)→ 退全量,慢但正确。
+function readSyncBaseline(kind) {
+  try {
+    const p = path.join(__dirname, "..", "mod", "panorama", "scripts", SYNC_KINDS[kind].fallback);
+    const src = fs.readFileSync(p, "utf8");
+    const data = syncData.extractAssignment(src, SYNC_KINDS[kind].name);
+    if (!data) return null;
+    const fingerprint = kind === "gamenames"
+      ? syncData.namesFingerprint(data)
+      : syncData.extractAssignment(src, "LCT_QUICKCHAT_FALLBACK_FINGERPRINT");
+    if (typeof fingerprint !== "string" || !fingerprint) return null;
+    return { fingerprint: fingerprint, data: data };
+  } catch (e) {
+    return null;
+  }
+}
+
+function runBtipcGet(o) {
+  const kind = String(o.get || "");
+  if (kind === "health") {
+    const cfgH = configStore.load();
+    const r = { ok: true, provider: cfgH.provider, version: readLocalVersion() || "unknown" };
+    if (cachedVersionInfo && cachedVersionInfo.ok && cachedVersionInfo.hasUpdate) {
+      r.updateInfo = {
+        hasUpdate: true,
+        currentVersion: cachedVersionInfo.currentVersion,
+        latestVersion: cachedVersionInfo.latestVersion,
+        releaseUrl: cachedVersionInfo.releaseUrl || GITHUB_REPO_URL + "/releases",
+      };
+    }
+    return r;
+  }
+  if (kind !== "gamenames" && kind !== "quickchat") return { ok: false, error: "unknown_get" };
+  const current = readSyncConfig(kind);
+  if (!current) return { ok: false, error: kind + "_not_found" };
+  const clientFp = typeof o.fp === "string" && o.fp ? o.fp : null;
+  const expect = typeof o.exp === "string" && o.exp ? o.exp : null;
+  return syncData.syncGet(kind, current, readSyncBaseline(kind), clientFp, o.off, o.lim, expect);
+}
+
 // btipc05:TRQ op 通道 —— 设置面板「保存/测试」+ 开机读配置(旧通道 6726 后已死,迁移)。
 // 载荷/响应回路与 HTTP /api/v1/config、/api/v1/test 同语义(同一 configStore/runTranslate)。
 // 响应恒为 JSON:空响应会被游戏侧判 translate_error,掩盖真实错误。
@@ -122,6 +184,8 @@ async function runBtipcOp(op, body, timeoutMs) {
   if (op === "config") {
     let obj = null;
     try { obj = JSON.parse(body || "{}"); } catch (e) { return { ok: false, error: "bad_json" }; }
+    // btipc07:数据接口("get" 字段)优先于配置读写;两者互斥(config 写只在有 obj.config 时发生)
+    if (obj && typeof obj.get === "string") return runBtipcGet(obj);
     const current = configStore.load();
     if (obj.config) {
       const next = configStore.applyMaskedUpdate(current, obj.config);
@@ -838,7 +902,8 @@ async function handleApi(req, res, url, bodyObj) {
     const gamenamesPath = path.join(__dirname, "..", "config", "gamenames.json");
     try {
       const data = JSON.parse(fs.readFileSync(gamenamesPath, "utf8"));
-      sendJson(res, 200, { ok: true, count: Object.keys(data).length, names: data });
+      // btipc07:补 fingerprint(与 BTIPC get=gamenames 同源),客户端可离线判断兜底是否过期
+      sendJson(res, 200, { ok: true, count: Object.keys(data).length, fingerprint: syncData.namesFingerprint(data), names: data });
     } catch (e) {
       sendJson(res, 200, { ok: false, error: "gamenames_not_found" });
     }

@@ -1,5 +1,7 @@
-// gb_replace_file.js — 替换 GameBanana 上的 0.1.3 文件(删旧行 + 上传新包 + 版本号 + 保存)
+// gb_replace_file.js — 替换 GameBanana 上指定版本的文件(删旧行 + 上传新包 + 版本号 + 保存)
 // 2026-08-16: 0.1.3 首包缺 core/hero_names.js, 桥离线; 此脚本用于上传修复包替换
+// 2026-10-03: 版本参数化(原来硬编码 babeltower-013); 用法 node gb_replace_file.js 1.0.6
+//             匹配键 = 版本号去点 → babeltower-106-win64, 兼容 GB 可能追加的 _hash 后缀。
 const puppeteer = require("puppeteer-core");
 const fs = require("fs");
 const path = require("path");
@@ -11,9 +13,13 @@ const EDIT_URL = "https://gamebanana.com/mods/edit/700107";
 const MOD_URL = "https://gamebanana.com/mods/700107";
 
 const version = process.argv[2] || "0.1.3";
+const vtag = version.replace(/\./g, "");               // 1.0.6 -> 106
+const fpat = `babeltower-${vtag}-win64`;                // 行匹配键(去掉全部点)
+const rowRx = new RegExp(fpat + ".*\\.zip");            // 容忍 GB 追加的 _hash 后缀
 const zipPath = path.join("F:\\BabelTower\\dist", `BabelTower-${version}-win64.zip`);
 if (!fs.existsSync(zipPath)) { console.error("ZIP NOT FOUND:", zipPath); process.exit(1); }
 console.log("ZIP:", zipPath, "size:", fs.statSync(zipPath).size);
+console.log("VERSION:", version, "| MATCH KEY:", fpat);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -80,20 +86,20 @@ const rowInfo = (page, pattern) => page.evaluate((pat) => {
   console.log("FILES READY");
 
   // 1) 删除旧的 0.1.3 行(若有)
-  const oldRows = await rowInfo(page, "babeltower-013");
-  console.log("OLD 0.1.3 ROWS:", JSON.stringify(oldRows));
-  const removed = await page.evaluate(() => {
+  const oldRows = await rowInfo(page, fpat);
+  console.log("OLD ROWS:", JSON.stringify(oldRows));
+  const removed = await page.evaluate((rx) => {
     const fs = document.getElementById("Files");
-    const li = [...fs.querySelectorAll("li")].find(li => /babeltower-013-win64\.zip/.test(li.innerText));
-    if (!li) return { ok: false, reason: "no 013 row" };
+    const li = [...fs.querySelectorAll("li")].find(li => new RegExp(rx, "i").test(li.innerText));
+    if (!li) return { ok: false, reason: "no old row" };
     const btn = li.querySelector(".TrashFile");
     if (!btn) return { ok: false, reason: "no remove btn" };
     btn.click();
     return { ok: true };
-  });
+  }, rowRx.source);
   console.log("REMOVE OLD:", JSON.stringify(removed));
   await sleep(3000);
-  const afterRemove = await rowInfo(page, "babeltower-013");
+  const afterRemove = await rowInfo(page, fpat);
   console.log("AFTER REMOVE:", JSON.stringify(afterRemove));
 
   // 2) 上传新包
@@ -105,7 +111,7 @@ const rowInfo = (page, pattern) => page.evaluate((pat) => {
   let uploaded = false;
   for (let i = 0; i < 72; i++) {
     await sleep(5000);
-    const cur = await rowInfo(page, "babeltower-013");
+    const cur = await rowInfo(page, fpat);
     if (cur.count > afterRemove.count) {
       console.log(`[${(i + 1) * 5}s] uploaded, rows now:`, JSON.stringify(cur));
       uploaded = true;
@@ -116,20 +122,20 @@ const rowInfo = (page, pattern) => page.evaluate((pat) => {
   if (!uploaded) { console.log("UPLOAD_TIMEOUT"); await browser.close(); process.exit(1); }
 
   // 3) 新行填版本号(0.1.3 行内最后一个 VersionInput)
-  const fillRow = await page.evaluate((ver) => {
+  const fillRow = await page.evaluate(({ ver, rx }) => {
     const fs = document.getElementById("Files");
-    const li = [...fs.querySelectorAll("li")].find(li => /babeltower-013-win64\.zip/.test(li.innerText));
-    if (!li) return { ok: false };
+    const li = [...fs.querySelectorAll("li")].find(li => new RegExp(rx, "i").test(li.innerText));
+    if (!li) return { ok: false, reason: "row not found" };
     const inputs = [...li.querySelectorAll("input.VersionInput")];
     const target = inputs[inputs.length - 1];
-    if (!target) return { ok: false };
+    if (!target) return { ok: false, reason: "no VersionInput in row" };
     const proto = Object.getPrototypeOf(target);
     const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
     setter.call(target, ver);
     target.dispatchEvent(new Event("input", { bubbles: true }));
     target.dispatchEvent(new Event("change", { bubbles: true }));
     return { ok: true, value: target.value };
-  }, version);
+  }, { ver: version, rx: rowRx.source });
   console.log("ROW VERSION FILL:", JSON.stringify(fillRow));
   await sleep(1000);
 

@@ -59,9 +59,11 @@ Bing 免 Key 与 Microsoft 双服务商均已实测,真实译文验证通过)。
 8. 聊天滚动(消息多到回收)后,译文应从缓存重建
 9. 打开 VConsole / Panorama 调试器,确认无 `[LCT]` 相关报错
 
-> 日志噪声:`bridge nav failed: panel dead (no lct-alive within 1.5s)` 每 15s 一条,
-> 是旧 HTML 面板通道的死链(该接口尚未迁 BTIPC,归 btipc07),**不代表桥挂了**;
+> 日志噪声已处理(护栏 `tests/lc_panel_nav_guard.test.js`):旧 HTML 面板通道失效后会判死并
+> 冷却 10 分钟,冷却内不再导航、不打日志 —— `bridge nav failed: panel dead` 从每 15s 一条
+> 降为每冷却周期一条摘要(细节日志全程仅一条)。看到这条摘要**不代表桥挂了**;
 > 判断桥是否活着看 `BTIPC TRQ` / `boot: config synced`。
+> 该通道承载的 `health`/`quickchat`/`gamenames` 接口本身仍未迁 BTIPC(归 btipc07)。
 
 ## 3. 构建
 

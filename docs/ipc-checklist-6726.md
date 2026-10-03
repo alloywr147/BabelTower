@@ -503,7 +503,7 @@ BTIPC: DONE win=… frames=1 bytes=6 total≈1820ms   (每 15s 一次)
 - 仿真器已打通 BTIPC 下行(`Msg` 落盘带引擎前缀 / `ImageLoaded` 捕获 / `MockPanel.SetImage` + `get id()`),38 帧配置读端到端 `END seq=37`;余下 27 FAIL 属 harness 10s 断言 vs 24s 开机读占单槽,不在官方测试清单。
 - **已知未定根因:启动首读的定时器偶发偏早**(05c 报 35000ms 却 10915ms 触发;05d 报 50000ms 却 24595ms)。仅发生在进程内第一次读,`syncBridgeConfig` 每 2s 重试自愈,后续请求死线均准确。
 - 16 红 fixture 待用户同局采样:技能冷却 → `XX正在冷却`、技能就绪 → `XX好了!`、Enemy Missing → `不见了`、Spotted → `被发现了`、轮盘 `我可以治疗你` + 未翻译整句长句原文(记时间点)。
-- `bridge nav failed: panel dead (no lct-alive within 1.5s)` 每 15s 一条,是 `op=log` 聊天日志上传走 nav 通道打不通(6726 后 `SetURL` 导航全灭)。与翻译链路无关(BTIPC 走面板字节通道),归 **btipc07 清死链**时一并处理。
+- ~~`bridge nav failed: panel dead (no lct-alive within 1.5s)` 每 15s 一条,是 `op=log` 聊天日志上传走 nav 通道打不通(6726 后 `SetURL` 导航全灭)。与翻译链路无关(BTIPC 走面板字节通道),归 **btipc07 清死链**时一并处理。~~ **已处理(2026-10-03)**:面板通道判死冷却 —— 连续 3 次 `src=""` 判死 → 10 分钟内 `dispatchViaPanel` 快速失败(不导航、不打日志),到点自动复探、导航成功即解除;细节日志全程只打一条,进冷却只打一条摘要;离线复探直连通道也限流 10 分钟一次。护栏 `tests/lc_panel_nav_guard.test.js`(23 断言)。**接口本身迁 BTIPC 仍是 btipc07**(health/quickchat/gamenames)。
 
 ## 16. HUD 气泡不挂译文:`quick` 判定过宽 → btipc05e 修复 + 实车确认(2026-10-03)
 

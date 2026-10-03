@@ -66,6 +66,14 @@
   const HUD_OVERLAY_LIMIT = 10; // HUD 译文浮层上限(超过则清理最旧,防内存泄漏)
   const TITLE_POLL_SECONDS = 0.3;
   const BRIDGE_ALIVE_SECONDS = 1.5;
+  // 面板通道判死:6726 起 SetURL 导航整条失效(每次 nav 都是 src="" 从不加载)。
+  // 连续 N 次"页面从未开始加载"才判死通道,并进入冷却期:期间不再尝试导航(免得每 15s 打一条
+  // `bridge nav failed: panel dead` 死链日志)。冷却到点自动复探,游戏改版修好可自愈。
+  const PANEL_NAV_DEAD_STREAK = 3; // 连续几次"页面从未加载"才判死(加载慢不算,避免误杀偶发抖动)
+  const PANEL_NAV_COOLDOWN_MS = 600000; // 判死后冷却 10 分钟再复探
+  const CANHTTP_REPROBE_MS = 600000; // 离线复探直连通道(AsyncWebRequest)的最小间隔:
+  // API 移除是游戏版本静态事实,不加限流会 复位→重探→再复位 每 5s 刷一条
+  // `bridge channel: reset to re-probe direct (was panel-only)`
   // ���P:health ��1%��d�pM�e�(MS�nb� DOM ��糧�)
   const BRIDGE_OFFLINE_GRACE_SECONDS = 25; // 桥页面存活标记的等待上限
   // 离线宽限:health 连续失败超过此秒数才把桥标红(避免打开设置面板时 DOM 抖动误报离线)
@@ -309,6 +317,9 @@
     panel: null, // 隐藏 HTML 桥面板(在 chat.xml 中用 <HTML> 标签声明)
     panelLogged: false,
     panelDead: false, // BUGFIX 0.1.3:面板导航失败标记,下次强制重新查找
+    navDeadStreak: 0, // 连续"页面从未加载"的导航失败计数(够 PANEL_NAV_DEAD_STREAK 次才判死通道)
+    navDeadUntil: 0, // 面板通道判死冷却截止(nowMs());期间 dispatchViaPanel 快速失败,不导航
+    navDeadLogged: false, // 本次会话是否已打过一条导航死链细节日志(此后只打"进入冷却"摘要)
     eventsRegistered: false,
     pending: null, // 统一在途桥请求 { id, onResult, deadline, sawAlive }
     bridgeUp: false,
@@ -319,6 +330,7 @@
     diagTitleCount: 0, // DIAG-6726:标题轮询诊断计数
     panelActivated: false, // EXP-6726b:面板已置可见/激活标记
     canHttp: null, // 直连通道(AsyncWebRequest)可用性,启动后探测一次;null=未探测
+    canHttpLastProbe: 0, // 最近一次直连通道探测时间(nowMs()),给离线复探限流用
     logBuffer: [], // 聊天日志缓冲(批量推送到桥)
     logFlushing: false,
     matchId: null, // 当前比赛 ID(缓存)
@@ -2099,6 +2111,7 @@ function injectTranslation(row, sig, text, fragment) {
       ok = false;
     }
     State.canHttp = ok;
+    State.canHttpLastProbe = nowMs();
     log("bridge transport: AsyncWebRequest " + (ok ? "available (direct)" : "removed/unavailable, using HTML panel channel"));
     return ok;
   }
@@ -2110,10 +2123,16 @@ function injectTranslation(row, sig, text, fragment) {
     return s === "http_exception" || s === "no_asyncwebrequest" || s.indexOf("removed") !== -1;
   }
 
+  // 面板通道是否处于"判死冷却"中:冷却内 dispatchViaPanel 直接走 !panel 分支快速失败,
+  // 既不再 SetURL 导航,也不再打 `bridge nav failed` 死链日志(此前每 15s 一条刷屏)。
+  function panelNavSuppressed() {
+    return State.navDeadUntil > nowMs();
+  }
+
   // HTML 面板通道:SetURL 导航 /bridge 页面,轮询 document.title 读回
   // (AsyncWebRequest 被移除的游戏版本唯一可用通道;DLCT 同款机制)
   function dispatchViaPanel(job) {
-    const panel = ensurePanel();
+    const panel = panelNavSuppressed() ? null : ensurePanel();
     if (!isValid(panel) || typeof panel.SetURL !== "function") {
       if (job.kind === "outgoing") {
         job.done(null, null);
@@ -2853,6 +2872,9 @@ function injectTranslation(row, sig, text, fragment) {
     if (title === TITLE_ALIVE) {
       markBridgeUp();
       pending.sawAlive = true;
+      // 导航真的成功过 => 面板通道可用,清掉判死计数与冷却
+      State.navDeadStreak = 0;
+      State.navDeadUntil = 0;
     } else if (title && title.indexOf(TITLE_PREFIX + pending.id) === 0) {
       // 轮询通道命中:标题 = 前缀 + id + JSON
       let payload = null;
@@ -2870,7 +2892,22 @@ function injectTranslation(row, sig, text, fragment) {
     if (!pending.sawAlive && nowMs() - pending.startedAt > BRIDGE_ALIVE_SECONDS * 1000) {
       State.pending = null;
       State.panelDead = true;
-      log("bridge nav failed: panel dead (no lct-alive within " + BRIDGE_ALIVE_SECONDS + "s) | " + navDiagSnapshot());
+      const snap = navDiagSnapshot();
+      // 硬死签名:src 为空 = 引擎压根没开始加载页面(6726 起 SetURL 导航整条失效)。
+      // 只有这种才累计判死;页面已加载但没来得及置 alive(有 src)只重置计数,
+      // 免得把偶发抖动误判成通道死而长期禁用。
+      if (snap.indexOf('src=""') !== -1) State.navDeadStreak += 1;
+      else State.navDeadStreak = 0;
+      if (State.navDeadStreak >= PANEL_NAV_DEAD_STREAK) {
+        State.navDeadStreak = 0;
+        State.navDeadUntil = nowMs() + PANEL_NAV_COOLDOWN_MS;
+        log("bridge nav: panel channel dead in this game build (SetURL never loads) | suppress nav " +
+          Math.round(PANEL_NAV_COOLDOWN_MS / 60000) + "min, auto re-probe after | " + snap);
+      } else if (!State.navDeadLogged) {
+        // 细节日志全程只打一次,之后进冷却只打上面那条摘要 => 死链日志从每 15s 一条降到约 10 分钟一条
+        State.navDeadLogged = true;
+        log("bridge nav failed: panel dead (no lct-alive within " + BRIDGE_ALIVE_SECONDS + "s) | " + snap);
+      }
       pending.onResult({ ok: false, error: "bridge_nav_failed" });
       return;
     }
@@ -3231,7 +3268,9 @@ function injectTranslation(row, sig, text, fragment) {
       if (freshH) return; // 新鲜期(含忙时)不打必死的 nav
     }
     // long offline + panel-only channel -> reset to re-probe direct (works if game supports AsyncWebRequest)
-    if (State.bridgeOfflineSince && (nowMs() - State.bridgeOfflineSince) > BRIDGE_OFFLINE_GRACE_SECONDS * 1000 && State.canHttp === false) {
+    // 限流:复位会立刻被下一次 detectAsyncWebRequest 打回 false,不加间隔就会每 5s 刷一条复位日志。
+    if (State.bridgeOfflineSince && (nowMs() - State.bridgeOfflineSince) > BRIDGE_OFFLINE_GRACE_SECONDS * 1000 && State.canHttp === false &&
+      nowMs() - State.canHttpLastProbe >= CANHTTP_REPROBE_MS) {
       State.canHttp = null;
       log("bridge channel: reset to re-probe direct (was panel-only)");
     }

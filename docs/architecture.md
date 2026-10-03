@@ -88,14 +88,20 @@
   配置/测试操作回 `{ok:false, error}`(状态栏给出具体错误)。
 - BTIPC 忙时**不立刻回落**:chat/outgoing 短等 `6 × 0.5s`(死线 12s),op 等满读死线
   (50s)+2s 缓冲,避免掉进必死的旧通道。
+- **面板通道判死冷却**(死链日志的处置,`tests/lc_panel_nav_guard.test.js` 护栏):③ 连续
+  `PANEL_NAV_DEAD_STREAK=3` 次 `src=""`(引擎压根没开始加载页面;加载慢不算,免得误杀)即判
+  通道死,随后 `PANEL_NAV_COOLDOWN_MS=10min` 内 `dispatchViaPanel` 直接走 `!panel` 快速失败
+  分支 —— 不再 `SetURL` 导航、不打日志;到点自动复探,导航一旦成功立即解除。
+  细节日志 `bridge nav failed` 全程只打一次,进冷却只打一条摘要;
+  离线复探直连通道(`reset to re-probe direct`)同样限流 `CANHTTP_REPROBE_MS=10min` 一次。
+  效果:死链日志从**每 15s 一条**降到每冷却周期一条。
 - **已知欠账**:②③ 尚未迁 BTIPC 的接口(`health`、`quickchat`、`gamenames` 动态同步)
   在当前游戏版本实际不可达 → 游戏侧降级走**打包内置**兜底:
   - 快捷语音模板 → `lingua_chat_quickchat_fallback.js`(构建时由 `node core/quickchat.js`
     从本机游戏 loc 重新生成;指纹不一致本应采纳桥侧语料,现在拿不到桥响应只能一直用打包版);
   - 名称保护名单 → `lingua_chat.js` 内硬编码的约 60 条 `PROTECT_NAMES`
     (桥侧全量 292 条在 `config/gamenames.json`,日志里 `game names synced from bridge` 因此从不出现);
-  同时每 15s 打一条 `bridge nav failed: panel dead` 死链日志。
-  这些接口迁 BTIPC + 清死链是下一阶段任务(btipc07)。
+  - 死链日志已被上面的判死冷却压掉,**但接口本身仍未迁 BTIPC** —— 这些接口迁 BTIPC 是下一阶段任务(btipc07)。
 
 ## 5. 配置
 

@@ -439,3 +439,67 @@ btipc6736: ALL DONE n=20 ok=20 fail=0
 4. 桥停机发消息 → `outgoing btipc: FAIL kind=timeout … -> send original` + 「翻译不可用,已按原文发送」,≤22s 必有结论。
 
 **回滚**:客户端回装上一份 VPK 备份;桥 `git checkout core/bridge_server.js core/btipc/transport.js && powershell -ExecutionPolicy Bypass -File scripts/restart_bridge.ps1`。
+
+## 15. btipc05b 首验失败 → 05c/05d 修复 + 实车复验(2026-10-03)
+
+### 15.1 首验现场(05b,09:19 起)
+
+| 指标 | 值 |
+|---|---|
+| `dispatch THREW` | **23** |
+| `busy, requeue` | **666**(单秒 74 行洪水) |
+| `RETRY crc` / `STORM enter` / `REQ_TIMEOUT` / `bridge offline` | 28 / 9 / 7 / 2 |
+| `op=config` 成功 | **0** |
+
+### 15.2 根因链(两处真回归,均由编辑引入)
+
+**① 主根因:误删 `} else {`。** `op` 分发里 `if (job.op === "test")` 的 `else` 被删,`op=config` 整块落进 `if(test)` 内:
+- `payload` 停在 `undefined` → `btipcUtf8Bytes(undefined).length` 抛出 → `dispatch THREW ×23/25`;
+- `op=test` 载荷随后被 config 赋值覆盖成 `op=config + {}` → 测试按钮发错载荷。
+
+**② 放大器:`pumpQueue` while 原地自旋。** busy 分支把 job `unshift` 回队首,while 立刻又 `shift` 出来 → 原地自旋,0.5s 延迟泵失效,`busyWaits=74` 在 <1ms 内打满 → console.log 洪水 → 桥 tail 迟 7~24s → 回声 8s 死线内收不到 → CRC 风暴 / `REQ_TIMEOUT` / `bridge offline`(同指标 btipc05 上局 = 0)。
+
+**铁律:先修真回归 → 再校正测试数据 → 最后重跑,禁止直接把红改绿。**
+
+### 15.3 修复
+
+| 版本 | 改动 |
+|---|---|
+| 05c | ① 恢复 `} else {`;② busy 分支置 `job._btipcDeferred = true`,`pumpQueue` 见标记即 `break`(重排 0.5s 延迟泵);③ 重投日志改首行 + 每 10 次 |
+| 05d | 读死线 35s→**50s**、op 忙等窗 37s→**52s** —— 实车成功读 `dt=43664ms`,另一次正卡在 `35025ms` 只到 `seq=22/38`,35s 余量仅 4.8s |
+
+### 15.4 A/B 实证
+
+| 构建 | `dispatch THREW` | `op=config` TRQ |
+|---|---|---|
+| 05b 跑仿真器 | 25 | 0 |
+| 05c | **0** | **20** |
+
+`tests/lc_btipc_guard.test.js`(11 项)对坏版 **4 FAIL / exit 1**,对修后 **11 PASS / exit 0**。
+
+### 15.5 实车复验(2026-10-03 11:13 起,VPK SHA256=AE9C44B9…)
+
+```
+loaded v1.0.7-6726-btipc05d; watching ChatMessages
+config btipc: ok win=c1c0da dt=43664ms ok=true
+boot: config synced from bridge (outgoing=bilingual, translateOwn=true)
+bridge online
+BTIPC: DONE win=… frames=1 bytes=6 total≈1820ms   (每 15s 一次)
+```
+
+| 指标 | 05b | 05d |
+|---|---|---|
+| `dispatch THREW` | 23 | **0** |
+| `busy, requeue` | 666 | **0** |
+| `BTIPC: DONE` | 0 | **27**(1 配置读 + 26 回声) |
+| `config btipc: ok` | 0 | **1**(`dt=43664ms`) |
+| 配置同步 | 失败 | **`boot: config synced`** |
+| 桥状态 | offline | **`bridge online`** |
+
+桥侧 E2E:op **5/5**(cfg-read `dt=23588` ≤35000 / cfg-write `dt=1862` ≤8000 / readback / test / health)、translate **4/4**(`hello→你好` / 缓存 / `t=en` 反向 / `t=zh-Hans`+BUSY)。
+
+### 15.6 证据边界与待办
+
+- 仿真器已打通 BTIPC 下行(`Msg` 落盘带引擎前缀 / `ImageLoaded` 捕获 / `MockPanel.SetImage` + `get id()`),38 帧配置读端到端 `END seq=37`;余下 27 FAIL 属 harness 10s 断言 vs 24s 开机读占单槽,不在官方测试清单。
+- **已知未定根因:启动首读的定时器偶发偏早**(05c 报 35000ms 却 10915ms 触发;05d 报 50000ms 却 24595ms)。仅发生在进程内第一次读,`syncBridgeConfig` 每 2s 重试自愈,后续请求死线均准确。
+- 16 红 fixture 待用户同局采样:技能冷却 → `XX正在冷却`、技能就绪 → `XX好了!`、Enemy Missing → `不见了`、Spotted → `被发现了`、轮盘 `我可以治疗你` + 未翻译整句长句原文(记时间点)。

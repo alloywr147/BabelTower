@@ -5,6 +5,14 @@
 
 const http = require("http");
 const path = require("path");
+const fs = require("fs");
+
+// btipc05c:仿真器打通 BTIPC 下行 —— 桥 tail 只认真 console.log,游戏侧 TRQ/REQ 行
+// 必须落盘桥才收得到;MockPanel 另补 SetImage(真 HTTP GET /btipc/dl),200 → 触发
+// ImageLoaded 置位。缺这两处时 128 位恒 0 → 全零轮 → CRC 必败,表现为 frameFails
+// 风暴 + "bridge offline" + 翻译全灭(属仿真环境缺口,非产品 bug)。
+const GAME_LOG = "F:/SteamLibrary/steamapps/common/Deadlock/game/citadel/console.log";
+let imageLoadedHandler = null;
 
 // node 原生 setTimeout 引用:mock 基础设施必须用它,不查全局
 // (test13 会摘掉全局 setTimeout 模拟 Panorama 环境,若 mock 依赖全局会被误炸)
@@ -36,6 +44,11 @@ class MockPanel {
     this._submits = [];
     this._focused = false;
   }
+  // btipc05c:Panorama Panel 暴露只读 .id —— 游戏侧 ImageLoaded 处理器读 panel.id 判
+  // BTIPCD* 前缀后才 st.fire[p]=1。原 mock 只有 _id → String(panel.id)="undefined"
+  // → 前缀不匹配提前 return → 128 位永不置 1 → 全零轮 → CRC 恒败。
+  // 这是仿真器 27 个 FAIL 的真正根因(环境缺口,非产品 bug)。
+  get id() { return this._id; }
   IsValid() { return !this._deleted; }
   GetParent() { return this._parent; }
   GetChildCount() { return this._children.length; }
@@ -71,6 +84,35 @@ class MockPanel {
   addChild(panel) { panel._parent = this; this._children.push(panel); return panel; }
   setClass(...cs) { cs.forEach((c) => this._classes.add(c)); return this; }
 }
+
+// btipc05c:图片面板下行(§3.1)—— 200 = 位1(触发 ImageLoaded 置位),404/出错 = 位0
+MockPanel.prototype.SetImage = function (url) {
+  const panel = this;
+  globalThis.__imgSet = (globalThis.__imgSet || 0) + 1;
+  if (globalThis.__imgSet === 1) console.log("[LCT-sim][dbg] SetImage FIRST url=" + String(url).slice(0, 110));
+  try {
+    const req = http.get(url, (res) => {
+      globalThis.__imgHttp = (globalThis.__imgHttp || 0) + 1;
+      if (globalThis.__imgHttp === 1) console.log("[LCT-sim][dbg] SetImage HTTP FIRST status=" + res.statusCode);
+      if (res.statusCode === 200) {
+        globalThis.__img200 = (globalThis.__img200 || 0) + 1;
+        res.resume();
+        nativeSetTimeout(() => {
+          if (imageLoadedHandler) {
+            globalThis.__imgFire = (globalThis.__imgFire || 0) + 1;
+            if (globalThis.__imgFire === 1) console.log("[LCT-sim][dbg] ImageLoaded handler FIRST fire");
+            try { imageLoadedHandler(panel); } catch (e) { console.log("[LCT-sim][dbg] handler THREW " + e.message); }
+          } else if (!globalThis.__imgNoHandler) {
+            globalThis.__imgNoHandler = true;
+            console.log("[LCT-sim][dbg] imageLoadedHandler IS NULL at fire time");
+          }
+        }, 0);
+      } else { res.resume(); }
+    });
+    req.on("error", (e) => { if (!globalThis.__imgErr) { globalThis.__imgErr = true; console.log("[LCT-sim][dbg] SetImage HTTP ERR " + e.message); } });
+    req.setTimeout(4000, () => { try { req.destroy(); } catch (e) {} });
+  } catch (e) { console.log("[LCT-sim][dbg] SetImage THREW " + e.message); }
+};
 
 // ---------------- 独立环境:面板树 + $ + 配置 + 模块加载 ----------------
 function freshEnv(cfg) {
@@ -135,10 +177,31 @@ function freshEnv(cfg) {
   let focusedPanel = null;
   const dispatchLog = [];
   globalThis.$ = {
-    Msg: (...a) => console.log("[LCT-sim]", ...a),
+    Msg: (...a) => {
+      console.log("[LCT-sim]", ...a);
+      // btipc05c:仅把 BTIPC TRQ/REQ 行落到真 console.log(桥 tail 自 [LCT] 起解析)。
+      // 只落这两类行 —— 全量落盘等于在仿真里重演一次 console.log 涌塞。
+      const line = a.map(String).join(" ");
+      if (line.indexOf("[LCT] BTIPC TRQ ") === 0 || line.indexOf("[LCT] BTIPC REQ ") === 0) {
+        try {
+          const d = new Date();
+          const p2 = (n) => ("0" + n).slice(-2);
+          const stamp = (d.getMonth() + 1) + "/" + d.getDate() + " " +
+            p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
+          fs.appendFileSync(GAME_LOG, stamp + " [PanoramaScript] " + line + "\n", "utf8");
+        } catch (e) {}
+      }
+    },
     Schedule: (sec, fn) => { const tid = nativeSetTimeout(fn, sec * 1000); envTimers.push(tid); return tid; },
     CreatePanel: (type, parent, id) => parent.addChild(new MockPanel(id)).setClass(type === "Label" ? "Label" : type),
-    RegisterForUnhandledEvent: () => {},
+    // btipc05c:原为空桩 → ImageLoaded 永不登记 → 128 位恒 0 → CRC 必败。现捕获处理器。
+    RegisterForUnhandledEvent: (name, fn) => {
+      if (name === "ImageLoaded") {
+        imageLoadedHandler = fn;
+        console.log("[LCT-sim][dbg] ImageLoaded handler REGISTERED");
+      }
+      return 0;
+    },
     DispatchEvent: (name, target) => { dispatchLog.push({ name, target }); },
     GetContextPanel: () => focusedPanel || contextPanel,
   };
@@ -625,6 +688,9 @@ async function main() {
   await test19_pureChineseStillSkipped();
   await test20_quickchatWhitelistSkip();
   console.log("\n=== RESULT: PASS " + passCount + " / FAIL " + failCount + " ===");
+  console.log("[LCT-sim][dbg] imgSet=" + (globalThis.__imgSet || 0) +
+    " http=" + (globalThis.__imgHttp || 0) + " http200=" + (globalThis.__img200 || 0) +
+    " fire=" + (globalThis.__imgFire || 0));
   process.exit(failCount === 0 ? 0 : 1);
 }
 

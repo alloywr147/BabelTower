@@ -15,7 +15,7 @@
   "use strict";
 
   const LOG_PREFIX = "[LCT]";
-  const VERSION = "1.0.7-6726-btipc05b"; // btipc05b 实车热修:op=config 读死线 8s→35s(读应答 400B=40帧×真机600ms/帧≈24s,8s必死,实车34连败根因)+ 写/测试应答瘦身 + 面板开读改用开机 mask(免24s慢读)+ op 忙等窗12s→37s(不再掉死通道);前代 btipc05:BTIPC v1 + ⑥上层整合:出站 TRQ + 入站 chat + 保存/测试/读配置 op(btipc05)+ BTIPC 健应回声(6726 后旧通道 SetURL 导航全灭 DIAG-6726,nav 只作 >45s 无成功时的判红兜底);另修 collectPanelConfig TDZ;前版 btipc04
+  const VERSION = "1.0.7-6726-btipc05d"; // btipc05d 实车首验收口:op=config 读死线 35s→50s + op 忙等窗 37s→52s —— 05c 实车首验已验通(THREW 23→0、requeue 洪水 666→0、开机读 DONE frames=38 bytes=375、boot: config synced、回声 DONE frames=1 每 15s 稳定),但成功那读 total=30229ms 而另一次正好卡在 35025ms、帧只到 seq=22/38:首发起跑竞态(r=1 全404/混BUSY)白烧 5~6 轮 ×2.5s STORM 罚时 + 中途 CRC 重试,35s 余量仅 4.8s,约 1/3 概率超时白等再重试;50s 覆盖最坏 ≈43s。承 btipc05c:① 恢复被误删的 `} else {`(05b 里 op=config 掉进 if(test) → payload undefined → dispatch THREW ×23,test 被覆盖成 op=config)+ ② pumpQueue _btipcDeferred break(消 while 原地自旋刷 requeue 洪水 → 桥 tail 迟 7~24s → 回声超时 → CRC 风暴);承 btipc05b:读写死线分离 + 写应答瘦身 + 面板开读用开机 mask;承 btipc05:BTIPC v1 + ⑥上层整合(出站 TRQ/入站 chat/保存测试读配置 op/健应回声);前版 btipc04
 
   // ---- 原版聊天结构 ID(当前 Deadlock 版本稳定)----
   const CHAT_ROOT_ID = "Chat";
@@ -1866,6 +1866,17 @@ function injectTranslation(row, sig, text, fragment) {
       const job = State.queue.shift();
       State.activeRequests += 1;
       dispatchJob(job);
+      // btipc05c:dispatchJob 若走了「让位重投」(job 已 unshift 回队首、activeRequests
+      // 已减回),必须立刻退出循环 —— 否则 while 会把同一个 job 再 shift 出来原地自旋,
+      // 把重投次数在 <1ms 内打满并挂上等量的 $.Schedule(0.5) 延迟泵(注释 L2310 说的
+      // 「原地自旋把次数打满」就是它)。实车 btipc05b 一局刷出 requeue 洪水
+      // (单秒 74 行 × 多次爆发)→ console.log 涌塞 → 桥 tail 追不上(回声 REQ 迟
+      // 7~24s 才被处理)→ 8s 回声死线内收不到 → CRC 风暴 + bridge offline;
+      // 同指标在 btipc05 上一局为 0。
+      if (job._btipcDeferred) {
+        job._btipcDeferred = false;
+        break;
+      }
     }
   }
 
@@ -2313,16 +2324,25 @@ function injectTranslation(row, sig, text, fragment) {
         const since = job.enqueuedAt || job._btipcSince;
         const waited = job._btipcWaits || 0;
         // btipc05b:op 不再 12s 就放弃 —— 队头若是一次 24s 的配置读,12s 放弃会
-        // 掉进必死旧通道(panel_channel_unavailable 假失败)。op 等满 37s(读死线+缓冲);
+        // 掉进必死旧通道(panel_channel_unavailable 假失败)。op 等满读死线+2s 缓冲;
         // chat/outgoing 维持 12s/6 次(兜底语义不变)。
-        const busyWaits = isOp ? 74 : 6;
-        const busyMs = isOp ? 37000 : 12000;
+        // btipc05d:读死线 35s→50s,忙等窗同步 37s→52s(否则 op 等到 37s 就掉旧通道,
+        // 前面 50s 白等);52s ÷ 0.5s 泵 = 104 次,与 busyMs 同时到顶,先到者停。
+        const busyWaits = isOp ? 104 : 6;
+        const busyMs = isOp ? 52000 : 12000;
         if (waited < busyWaits && nowMs() - since < busyMs) {
           job._btipcWaits = waited + 1;
+          // btipc05c:让位时置 _btipcDeferred —— pumpQueue 见到就 break,不再原地
+          // 自旋重 shift 同一个 job(见 pumpQueue 处注释)。0.5s 延迟泵从此真正生效,
+          // op 才是「等 37s」而不是「1ms 内空转打满 74 次」。
+          job._btipcDeferred = true;
           State.queue.unshift(job);
           State.activeRequests = Math.max(0, State.activeRequests - 1);
           $.Schedule(0.5, pumpQueue);
-          log(tag + ": busy, requeue wait #" + (waited + 1));
+          // 只记首行 + 每 10 次:一次 op 最多 8 行,避免把 console.log 刷成洪水
+          if (waited === 0 || (waited + 1) % 10 === 0) {
+            log(tag + ": busy, requeue wait #" + (waited + 1) + "/" + busyWaits);
+          }
           return true;
         }
         return false;
@@ -2337,13 +2357,21 @@ function injectTranslation(row, sig, text, fragment) {
         if (job.op === "test") {
           payload = "op=test;tm=" + Math.max(4000, (State.cfg.timeoutMs || 15000) - 4000) + "\n" + raw;
           timeoutMs = Math.max(State.cfg.timeoutMs || 15000, 15000);
-        // btipc05b:读/写死线分离。读应答 maskCompact ≈400B=40 帧 × 真机 600ms/帧
-        // ≈24s —— 原 8s 必超时(实车 config FAIL 34 连败的根因);写应答已瘦到
-        // {ok:true}(9B/1帧≈3s)维持 8s 快速失败。BTIPC.request 对 timeoutMs 无钳制
-        // (仅缺省时用 30s),35s 直通;40 帧常态 26s + CRC 重试/卡顿余量 < 35s。
-        const isRead = String(raw).trim() === "{}";
-        payload = "op=config\n" + raw;
-        timeoutMs = isRead ? 35000 : 8000;
+        } else {
+          // btipc05b:读/写死线分离。读应答 maskCompact ≈400B=40 帧 × 真机 600ms/帧
+          // ≈24s —— 原 8s 必超时(实车 config FAIL 34 连败的根因);写应答已瘦到
+          // {ok:true}(9B/1帧≈3s)维持 8s 快速失败。
+          // btipc05c:此 `else` 曾被误删 → op=config 整块跳过、payload 停在 undefined
+          // → L2369 btipcUtf8Bytes(undefined).length 必炸(实车 dispatch THREW ×23),
+          // 且 op=test 会被随后的 config 赋值覆盖成 "op=config\n{}"(测试按钮发错载荷)。
+          // btipc05d:35s → 50s。05c 实车首验:成功那读 total=30229ms,而另一次
+          // 正好卡在 35025ms、帧只到 seq=22/38 —— 首发起跑竞态(r=1 全 404/混 BUSY)
+          // 会白烧 5~6 轮 ×2.5s(STORM 罚时),再叠加中途 CRC 重试,35s 余量仅 4.8s,
+          // 实测约 1/3 概率超时 → 白等 35s 再重试。50s 覆盖「竞态 15s + 38 帧 23s +
+          // 中途 2 次 STORM 5s」≈43s 的最坏情形。写仍 8s(1 帧,无帧竞态问题)。
+          const isRead = String(raw).trim() === "{}";
+          payload = "op=config\n" + raw;
+          timeoutMs = isRead ? 50000 : 8000;
         }
       } else if (isChat) {
         payload = text;

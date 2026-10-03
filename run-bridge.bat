@@ -11,6 +11,15 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
+if not exist "%~dp0core\bridge_server.js" (
+    echo [LCT] Missing file: core\bridge_server.js
+    echo [LCT] The install is incomplete. Re-extract the FULL release zip
+    echo [LCT] Keep its folder structure intact, then run this again.
+    echo.
+    pause
+    exit /b 1
+)
+
 set "NODE_EXE="
 if exist "portable-node\node.exe" (
     set "NODE_EXE=portable-node\node.exe"

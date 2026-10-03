@@ -74,6 +74,11 @@ A: 双击 run-bridge.bat(诊断启动器):它前台运行桥,报错会停在窗�
    常见原因:解压不完整(core 目录缺文件)。请重新解压完整安装包,不要删除 core 里任何文件。
    崩溃详情在 logs\bridge.log,反馈问题时请附上这个文件。
 
+Q: 双击某个 .bat 提示 Missing file: xxx?
+A: 启动器做了入口自检:缺哪个文件就直接点名,不再抛 PowerShell 红字然后窗口一闪而过。
+   这说明安装包没解压完整(或 core\ / scripts\ 被删)——重新解压完整 zip,
+   保持目录结构,不要删 core 和 scripts 里的任何文件。
+
 Q: 游戏里没反应?
 A: 确认 VPK 装到了 addons 目录且游戏完全重启过;确认 /tr 能打开设置面板。
 
@@ -93,6 +98,8 @@ A: 游戏部分:Mod Manager 里禁用/删除,或删掉 addons 里对应的 vpk�
   restart_bridge.bat     一键重启桥 + 健康检查(桥没起来先点它)
   run-bridge.bat         诊断启动器(报错不闪退;反馈问题前先跑它)
   StartDeadlock.bat      手动启动(桥 + 游戏)
-  scripts\autostart.ps1  自启脚本(一般由上面的 bat 调用,无需手动执行)
+  scripts\autostart.ps1  自启/卸载脚本(由上面的 bat 调用,无需手动执行)
+  scripts\restart_bridge.ps1  重启桥(由 restart_bridge.bat 调用)
+  scripts\bridge_health.ps1   健康检查(由 StartDeadlock.bat 调用)
 
 更多说明见 README.md;源代码与构建方法见 GitHub 仓库。

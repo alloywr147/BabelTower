@@ -534,7 +534,7 @@ BTIPC: DONE win=… frames=1 bytes=6 total≈1820ms   (每 15s 一次)
 
 **放大效应**:不止 L3408 直接 `return`,L3378/L3389 的**缓存恢复也被 `!skipTranslation` 拦住** → 即使缓存里已有 `hi→嗨`,HUD 行也注入不进去。即"HUD 气泡 100% 拿不到译文"。
 
-### 16.4 修复(`83696eb`,VERSION → `1.0.7-6726-btipc05e`)
+### 16.4 修复(`83696eb`,VERSION → `1.0.6-6726-btipc05e`)
 
 HUD 行的 DOM 标记须由**文本侧再确认**才跳过:
 
@@ -561,7 +561,7 @@ if (record.quick) {
 
 **实车(14:03 重启)**:
 
-- `loaded v1.0.7-6726-btipc05e` ✓
+- `loaded v1.0.6-6726-btipc05e` ✓
 - `!lcttest hello` → `translated [hud] <unknown>: 你好` ✓(重启后缓存空,走真链路)
 - 轮盘消息 13 条(`上了`/`攻击 1 级`/`被发现了`/`谢了！` 等)全部正确跳过 ✓
 - **14:14 打字 `ggwp` → HUD 气泡下挂出「好局打得好」—— 用户肉眼确认 ✅(修复前此处 100% 空白)**

@@ -59,7 +59,9 @@ check("busy 分支置 _btipcDeferred = true", /_btipcDeferred = true/.test(src))
 
 // ---- 4. 版本标 / 前缀常量 ----
 const ver = (src.match(/const VERSION = "([^"]+)"/) || [])[1] || "";
-check("VERSION 已升版(含 btipc 标)", /1\.0\.7-6726-btipc\d/.test(ver), "got=" + ver);
+// 版本号 = 本次发布版(改发布版时此处与 lingua_chat.js VERSION 必须同步),
+// 后缀 btipcNNN 记录构建序;玩家日志 `loaded vX.Y.Z-…` 必须与 Release/GB 标题一致。
+check("VERSION 对齐发布版(含 btipc 标)", /1\.0\.6-6726-btipc\d/.test(ver), "got=" + ver);
 check("BTIPC 面板前缀 BTIPCD(6 字符,与探针隔离)",
   /BTIPC_PANEL_PREFIX = "BTIPCD"/.test(src));
 

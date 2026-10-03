@@ -15,7 +15,7 @@
   "use strict";
 
   const LOG_PREFIX = "[LCT]";
-  const VERSION = "1.0.7-6726-btipc05d"; // btipc05d 实车首验收口:op=config 读死线 35s→50s + op 忙等窗 37s→52s —— 05c 实车首验已验通(THREW 23→0、requeue 洪水 666→0、开机读 DONE frames=38 bytes=375、boot: config synced、回声 DONE frames=1 每 15s 稳定),但成功那读 total=30229ms 而另一次正好卡在 35025ms、帧只到 seq=22/38:首发起跑竞态(r=1 全404/混BUSY)白烧 5~6 轮 ×2.5s STORM 罚时 + 中途 CRC 重试,35s 余量仅 4.8s,约 1/3 概率超时白等再重试;50s 覆盖最坏 ≈43s。承 btipc05c:① 恢复被误删的 `} else {`(05b 里 op=config 掉进 if(test) → payload undefined → dispatch THREW ×23,test 被覆盖成 op=config)+ ② pumpQueue _btipcDeferred break(消 while 原地自旋刷 requeue 洪水 → 桥 tail 迟 7~24s → 回声超时 → CRC 风暴);承 btipc05b:读写死线分离 + 写应答瘦身 + 面板开读用开机 mask;承 btipc05:BTIPC v1 + ⑥上层整合(出站 TRQ/入站 chat/保存测试读配置 op/健应回声);前版 btipc04
+  const VERSION = "1.0.7-6726-btipc05e"; // btipc05d 实车首验收口:op=config 读死线 35s→50s + op 忙等窗 37s→52s —— 05c 实车首验已验通(THREW 23→0、requeue 洪水 666→0、开机读 DONE frames=38 bytes=375、boot: config synced、回声 DONE frames=1 每 15s 稳定),但成功那读 total=30229ms 而另一次正好卡在 35025ms、帧只到 seq=22/38:首发起跑竞态(r=1 全404/混BUSY)白烧 5~6 轮 ×2.5s STORM 罚时 + 中途 CRC 重试,35s 余量仅 4.8s,约 1/3 概率超时白等再重试;50s 覆盖最坏 ≈43s。承 btipc05c:① 恢复被误删的 `} else {`(05b 里 op=config 掉进 if(test) → payload undefined → dispatch THREW ×23,test 被覆盖成 op=config)+ ② pumpQueue _btipcDeferred break(消 while 原地自旋刷 requeue 洪水 → 桥 tail 迟 7~24s → 回声超时 → CRC 风暴);承 btipc05b:读写死线分离 + 写应答瘦身 + 面板开读用开机 mask;承 btipc05:BTIPC v1 + ⑥上层整合(出站 TRQ/入站 chat/保存测试读配置 op/健应回声);前版 btipc04
 
   // ---- 原版聊天结构 ID(当前 Deadlock 版本稳定)----
   const CHAT_ROOT_ID = "Chat";
@@ -1569,7 +1569,22 @@
   function shouldSkip(record) {
     const text = record.text;
     if (!text || text.length < 2) return true;
-    if (record.quick) return true; // 游戏原生快捷短语/Ping 已由游戏本地化,不调用翻译接口
+    if (record.quick) {
+      // 游戏原生快捷短语/Ping 已由游戏本地化,不调用翻译接口。
+      // 但 DOM 标记的可信度分容器:
+      //   · 聊天/大厅行 → PingLabel 是专用标记,直接可信(16/26 红 fixture 基线原样不动);
+      //   · HUD 顶栏行 → 统一模板:10-02 exp6738 dump 实锤 PingStyleIcon(+SubjectIcon/
+      //     CooldownTimer/ResponseHeroes)是常驻槽位,打字消息同样命中 → 标记不可信,
+      //     必须由文本侧再确认"已本地化"才跳过。否则 HUD 气泡 100% 拿不到译文 ——
+      //     不止 L3408 直接 return,连 L3378/L3389 的缓存恢复也被 !skipTranslation 拦住,
+      //     缓存里有译文也注入不进去。
+      //     10-03 实车:hi/gg/防守分路/FOR THE KING RAAAAH 全部 `diag: quick row hud=1` 后
+      //     无下文,当天 `translated [hud]` = 0;而 !lcttest ok(无 ping 标记的构造行)
+      //     全链路走通 → 管线无问题,是判定过宽。
+      const textLocalized = isQuickChatTemplate(text) || (!State.cfg.force && isTargetLanguageText(text));
+      if (!record.hud || textLocalized) return true;
+      // HUD 行 + 标记存疑(既非已知轮盘语料、也不是目标语言)→ 落到下面的正常判定
+    }
     if (isQuickChatTemplate(text)) return true; // 本地化模板白名单:快捷语音渲染结果(含参数填空),精确命中即跳过
     if (text.charAt(0) === "/") return true; // 指令消息
     if (/^[\d\s\W_]+$/.test(text)) return true; // 纯数字/符号

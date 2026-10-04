@@ -1925,7 +1925,48 @@ function injectTranslation(row, sig, text, fragment) {
     while (State.queue.length > 0 && State.activeRequests < MAX_ACTIVE_REQUESTS) {
       const job = State.queue.shift();
       State.activeRequests += 1;
-      dispatchJob(job);
+      // 2026-10-04 实车:pumpQueue:1928 抛过一次 —— 错误消息为空、栈里没有
+      // dispatchJob 帧(= 抛在调用点本身)。此刻槽位已 +1,而 dispatchJob 自己的收尾
+      // (finishJob / failJob,内含「减槽 + 重泵」)一次都没跑到。MAX_ACTIVE_REQUESTS=1
+      // 是单槽 → 槽位永久占死 → while 条件永假 → 出站队列从此不再派发任何任务。
+      // 实证:11:26:25 抛一次,此后 bridge.log 再无 op=config / op=translate /
+      // target=(只剩 echo——走 btipcSend 不经本队列——GC、IMG-HIT);console.log 里
+      // `loaded v` 只出现 1 次 → 脚本没重载过、State 没重建,槽位一直没还回来。
+      // 铁律:dispatchJob 的任何同步异常都必须在这里补记账,绝不允许泄漏槽位。
+      let _threw = null;
+      try {
+        dispatchJob(job);
+      } catch (e) {
+        _threw = e;
+      }
+      if (_threw) {
+        State.activeRequests = Math.max(0, State.activeRequests - 1);
+        const _err = String((_threw && (_threw.message || _threw.name)) || _threw || "unknown").slice(0, 200);
+        job.attempts = (job.attempts || 0) + 1;
+        log("dispatchJob threw: " + _err + " kind=" + job.kind +
+            (job.op ? " op=" + job.op : "") + " attempts=" + job.attempts);
+        if (job.attempts < RETRY_LIMIT) {
+          // 重投用延迟泵,不原地自旋(原因见下方 btipc05c 注释)
+          State.queue.unshift(job);
+          $.Schedule(RETRY_DELAY_SECONDS, pumpQueue);
+        } else {
+          // 结算后丢弃:出站按原文发(绝不吞用户消息),桥回 {ok:false},chat 放开去重
+          log("dropping job after " + job.attempts + " dispatch throws: kind=" + job.kind +
+              (job.op ? " op=" + job.op : ""));
+          try {
+            if (job.kind === "outgoing") {
+              job.done(null, null);
+            } else if (job.kind === "bridge" && typeof job.done === "function") {
+              job.done({ ok: false, error: "dispatch_threw:" + _err.slice(0, 80) });
+            } else if (job.kind === "chat" && job.sig) {
+              try { State.seen.delete(job.sig); } catch (e2) {}
+            }
+          } catch (e3) {
+            log("settlement threw: " + String((e3 && (e3.message || e3)) || e3).slice(0, 120));
+          }
+        }
+        break;
+      }
       // btipc05c:dispatchJob 若走了「让位重投」(job 已 unshift 回队首、activeRequests
       // 已减回),必须立刻退出循环 —— 否则 while 会把同一个 job 再 shift 出来原地自旋,
       // 把重投次数在 <1ms 内打满并挂上等量的 $.Schedule(0.5) 延迟泵(注释 L2310 说的

@@ -50,7 +50,22 @@ check("op 忙等窗 ≥ 52s(跟随读死线)", !!bw && Number(bw[1]) >= 52000,
 // ---- 3. pumpQueue 让位必 break(否则原地自旋刷洪水)----
 const pumpIdx = src.indexOf("function pumpQueue()");
 check("找到 pumpQueue", pumpIdx > 0, "idx=" + pumpIdx);
-const pumpBody = pumpIdx > 0 ? src.slice(pumpIdx, pumpIdx + 900) : "";
+// 函数体按花括号配对取,不能用固定窗口:2026-10-04 缺陷 B 给 pumpQueue 加了
+// try/catch + 注释,pumpQueue 变长后固定 900 字符窗口把 _btipcDeferred 挤出去
+// → 探针误报(被查的性质其实一直都在)。取不到就退回放大窗口兜底。
+let pumpBody = "";
+if (pumpIdx > 0) {
+  let d = 0;
+  for (let i = src.indexOf("{", pumpIdx); i > 0 && i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "{") d += 1;
+    else if (ch === "}") {
+      d -= 1;
+      if (d === 0) { pumpBody = src.slice(pumpIdx, i + 1); break; }
+    }
+  }
+}
+if (!/_btipcDeferred/.test(pumpBody)) pumpBody = src.slice(pumpIdx, pumpIdx + 4000);
 check("pumpQueue 消费 _btipcDeferred 并 break(防原地自旋)",
   /_btipcDeferred/.test(pumpBody) && /break;/.test(pumpBody),
   "缺失 → while 把 unshift 回队首的同一 job 再 shift 出来打转," +

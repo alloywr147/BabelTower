@@ -221,5 +221,35 @@ ok(/afterRealMs\(timeoutMs \+ 2000, function/.test(lc), "deadman 已接线到 af
 ok(/return State\.btipcActive === st/.test(lc), "死线 alive 守卫等价于旧的 btipcActive !== st");
 ok(/alive && !alive\(\)/.test(lc), "afterRealMs 支持 alive 提前停轮询");
 
+// ---------- ⑩ 缺陷 B(2026-10-04 11:26 实车):dispatchJob 抛异常绝不许泄漏单槽槽位 ----------
+// 实车:pumpQueue:1928 抛异常(错误消息为空、栈里没有 dispatchJob 帧 = 抛在调用点)。
+// 此刻 activeRequests 已 +1,而 dispatchJob 自己的收尾(finishJob/failJob,内含减槽+重泵)
+// 一次都没跑到;MAX_ACTIVE_REQUESTS=1 是单槽 → 槽位永久占死 → while 条件永假 → 出站队列
+// 从此不再派发任何任务。现象:11:26:25 抛一次后,bridge.log 再无 op=config / op=translate /
+// target=(只剩 echo——走 btipcSend 不经本队列——GC、IMG-HIT),而 console.log 里 `loaded v`
+// 只出现 1 次 → 脚本没重载过、State 没重建,槽位一直没还回来。
+console.log("--- 缺陷 B:dispatchJob 同步异常必须补记账(单槽不许泄漏) ---");
+let _pq = "";
+{
+  const m = lc.indexOf("function pumpQueue() {");
+  if (m >= 0) {
+    let d = 0;
+    for (let i = m; i < lc.length; i += 1) {
+      const ch = lc[i];
+      if (ch === "{") d += 1;
+      else if (ch === "}") { d -= 1; if (d === 0) { _pq = lc.slice(m, i + 1); break; } }
+    }
+  }
+}
+// 括号配对可能被注释/字符串里的花括号打乱;取不到函数体就退回全文件比对
+if (!/dispatchJob\(job\)/.test(_pq)) _pq = lc;
+ok(/try\s*\{\s*dispatchJob\(job\);[\s\S]*?\}\s*catch\s*\(e\)/.test(_pq), "dispatchJob 被 try/catch 包住");
+ok(/State\.activeRequests = Math\.max\(0, State\.activeRequests - 1\)/.test(_pq), "异常路径补减槽位(否则单槽永久占死、队列永不再派发)");
+ok(/dispatchJob threw: /.test(_pq), "异常落日志(实车那次错误消息为空,查不到根因)");
+ok(/job\.attempts < RETRY_LIMIT/.test(_pq), "重投有上限(否则永久抛的 job 反复占泵)");
+ok(/job\.done\(null, null\)/.test(_pq), "出站超限结算按原文发送(绝不吞用户消息)");
+ok(/job\.done\(\{ ok: false, error:/.test(_pq), "桥任务超限结算回 {ok:false}(不吊死调用方)");
+ok(/break;/.test(_pq), "异常后退出本轮泵(不原地自旋,原因见 btipc05c 注释)");
+
 console.log("RESULT: PASS " + pass + " / FAIL " + fail + " / SKIP " + skipped);
 process.exit(fail > 0 ? 1 : 0);

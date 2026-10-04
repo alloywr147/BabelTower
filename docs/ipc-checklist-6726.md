@@ -579,11 +579,17 @@ if (record.quick) {
 
 | 位置 | 含义 | 当前值 |
 |---|---|---|
-| `lingua_chat.js` 的 `const VERSION` | **打进 pak 的版本串**(玩家日志 `loaded …` 看的就是它) | `1.0.7-6726-btipc05e` |
-| `VERSION` 文件 | 发布号 | `1.0.7` |
-| GitHub Release tag | **已发布版** | `v1.0.7`(@ `ac9eae1`) |
-| GameBanana 全局版本 / 文件行版本 | **已发布版** | `1.0.7` |
-| `tests/lc_btipc_guard.test.js` 断言 | 锁死 `const VERSION`,**升版必须两处同步改**,否则测试红 | `/1\.0\.7-6726-btipc\d/` |
+| `lingua_chat.js` 的 `const VERSION` | **打进 pak 的版本串**(玩家日志 `loaded …` 看的就是它) | `1.0.8-6726-btipc07d` |
+| `VERSION` 文件 | 发布号 | `1.0.8` |
+| GitHub Release tag | **已发布版** | `v1.0.8`(@ `ffe9fb8`) |
+| GameBanana 全局版本 / 文件行版本 | **已发布版** | `1.0.8`(文件 `babeltower-108-win64.zip` / `1836617`) |
+| `tests/lc_btipc_guard.test.js` 断言 | 锁死 `const VERSION` **形态 + 主版本等于 `VERSION` 文件**,**升版两处必须同步改**,否则测试红 | 形态 `/^\d+\.\d+\.\d+-6726-btipc\d/`,主版本与 `VERSION` 比对 |
+
+> **1.0.8 起断言不再写死具体版本号**:原来 `/1\.0\.7-6726-btipc\d/` 每次升版都得手改一次、
+> 忘改就假红。现改为「形态 + 主版本 == `VERSION` 文件」,该查的("两处必须一起改")没丢,
+> 但不再随版本号腐烂。同理 `scripts/version_check.js` 的 `vf !== cv` 也换成了 `sameRelease()`
+> (允许 `代码常量 === 发布号` 或 `startsWith(发布号 + "-")`)—— 该脚本写于 1.0.0-beta.2 时代,
+> 与本表口径冲突,**自 v1.0.1 起每次发版都误报红**,2026-10-04 一并修正。
 
 #### 本轮真正该发的是 1.0.7,不是 1.0.6
 
@@ -601,6 +607,23 @@ if (record.quick) {
 1. **GitHub**:删 `v1.0.6` release + tag → 以 `ac9eae1` 打 `v1.0.7` → 传 `BabelTower-1.0.7-win64.zip`(36,989,614B)+ `pak01_dir.vpk`(427,866B),标 Latest。
 2. **GameBanana**:上传 `babeltower-107-win64_5d904.zip` → 行版本 + 全局版本均 `1.0.7`;条目 `460716` 改标题/版本为 1.0.7 并改绑 107 文件;条目 `458399`(9/25 那条 1.0.6)按用户决定**原样保留**。
 3. **包内 `README.md`** 由 `1.0.6 (2026-09-25)` 改为 `1.0.7 (2026-10-03)` 并重打包重传 —— **README 在 zip 里,漏改会把旧版本号发出去**。
+
+#### 1.0.8 发版记录(2026-10-04)
+
+**发版前查重(铁律,两渠道都查)**:`gh release list` 最新为 `v1.0.7`、
+`node scripts/gb_updates_probe.js 1.0.8` → `含[1.0.8]: false` → **两渠道均未消耗**,可发。
+
+| 渠道 | 落位结果 |
+|---|---|
+| GitHub | `v1.0.8` = **Latest**(@ `ffe9fb8`),资产 `BabelTower-1.0.8-win64.zip`(37,026,268B)+ `pak01_dir.vpk`(456,376B) |
+| GameBanana | 上传 `babeltower-108-win64.zip`(`1836617`,37,026,268B,MD5 `8b687f62…`)→ 行版本 `1.0.8` + 全局版本 `1.0.7`→`1.0.8`;新增更新条目 5 条 changelog(4×Bugfix + 1×Feature)+ blurb + 绑定 108 文件 |
+| 包内自报 | `README.md` → `1.0.8 (2026-10-04)`;抠包核验 zip 内 README 含 `1.0.8`、`安装使用说明.txt` 含 `-condebug`、`lingua_chat.vjs_c` 含 `const VERSION = "1.0.8-6726-btipc07d"` |
+| 装车 | 车上 `pak15_dir.vpk` == 发布 `pak01_dir.vpk`(`456376B` / SHA `501C4FC1EC772BDD`),备份 `pre-1.0.8-release-20261004-131432` |
+| 回读验收 | GB API `_sVersion: "1.0.8"`、`_aFiles[1836617]._sVersion: "1.0.8"` 且 size 与本地 zip 逐字节一致 |
+
+**同批改动**:`安装使用说明.txt` 新增「第 4 步:给 Deadlock 加 `-condebug` 启动参数(必做)」
+及对应 FAQ(不设就是静默失效,判据 `game console.log found:`),
+`tests/launcher_condebug_guard.test.js` 加 3 条护栏锁住这段说明。
 
 #### 口径纪律
 

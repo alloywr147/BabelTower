@@ -777,12 +777,18 @@ SHA256 `0BF7B6CC1289DE0F` == dist 源;备份链 btipc07b ← btipc07 ← navdead
 **明确不动的**:旧通道里 `dispatchJob` 的 `$.Schedule(20)`(`viaBtipc` 先返回,走不到)、
 `checkBridgeMissing` 的 `$.Schedule(12)`(见下)。
 
-**假红复核(仍记账不修)**:07:22:58 `bridge offline: 请先启动 core/bridge_server.js`
-在 boot 内就打出。`warnBridgeOffline` 只有两个调用点(`pollTitle` / `checkBridgeMissing`),
-而 boot 时 `State.pending` 只可能来自旧通道 `setPending`(deadline ≥15s)—— 时间对不上,
-最可能是 `checkBridgeMissing`。**但根因是 panel nav 在 6726 全灭 + boot 时
-`State.bridgeUp` 尚未被 BTIPC 证明;把 12s 调度改准也只是把这条从 +1s 挪到 +12s,
-`panelWarned` 一锁就不再复原。** 31s 后被 `markBridgeUp` 修好。⇒ **时间不改变结论,不动。**
+**假红复核(仍记账不修,第三轮把机制坐实了)**:07:22:58、09:01:26 两次
+`bridge offline: 请先启动 core/bridge_server.js` 都在 **boot 同一秒**打出。
+`warnBridgeOffline` 只有两个调用点,`pollTitle` 那条要求 `State.pending.deadline <= nowMs()`,
+而 `setPending` 一定写 `nowMs() + (timeoutMs || 15000)`(L2656)—— 起点即过期,时间上不可能;
+⇒ 只能是 `checkBridgeMissing`。它唯一的触发是 boot 里的
+`$.Schedule(12.0, checkBridgeMissing)`(L7115),**却在 0 秒就跑了** ——
+这正是**缺陷 A 的同胞**(`$.Schedule` 在加载窗口早触发),不是 panel nav 也不是 pending。
+
+**但结论不变**:即便调度准了,+12s(=09:01:38)`State.bridgeUp` 仍是 false
+(config 要 09:01:57 才回),`checkBridgeMissing` L2841 照样 `warnBridgeOffline()`。
+⇒ **改准时间只会把这条从 +0s 挪到 +12s,一条都不会少;`panelWarned` 一锁不复原。**
+31s 后被 `markBridgeUp` 修好。⇒ **时间不改变结论,不动(与 L777 的"明确不动"一致)。**
 
 **验收 §8 进度**:1 ✅ / 2 ✅ / 3 代码路径已跑到(`onBridgeAlive` 写
 `桥已连接 · bing`、health detail 带 provider;这行无日志,**建议目视确认**)/ 4 ⬜ / 5 ⬜ /
@@ -796,3 +802,41 @@ SHA256 `0BF7B6CC1289DE0F` == dist 源;备份链 btipc07b ← btipc07 ← navdead
 
 **装车**:`bak-pre-btipc07c-20261004-084505`(451733B)→ 槽位 453743B,
 SHA256 `2647B7D0B5674A49` == dist;备份链 **c ← b ← a ← navdeadfix** 四级可回滚。
+
+### 17.10 第三轮实车(btipc07c,2026-10-04 09:01)— 缺陷 A 修复验证通过
+
+**核心:config 一次成功,跑满 31873ms** —— 上一轮同一发在 20278ms 被
+`REQ_TIMEOUT 50000ms` 打死,这一轮 31.9s > 20.3s 仍存活并成功,且**全程只有一次
+config 读取**(防重入同时生效)。`afterRealMs` 生效的直接证据。
+
+| 里程碑 | 首轮 07:00 | 二轮 07:22(07b) | **三轮 09:01(07c)** |
+|---|---|---|---|
+| config 就绪 | 95s(3 次) | 48s(2 次) | **31s(1 次)** |
+| gamenames 就绪 | — | 70s | **44s** |
+| quickchat 就绪 | 99s | 79s | **53s** |
+| config 读取次数 | 3 | 2 | **1** |
+
+短死线同样准:09:07:39 `REQ w=73ca40` → 09:07:47
+`REQ_TIMEOUT after 8000ms`,**8 秒整**,0.25s 轮询步长无可见偏差。
+
+桥侧是瞬时的(`ok dt=1010ms out=375B frames=38`),31.9s 全在下行帧投递
+(≈0.84s/帧 × 38 片);gamenames 握手桥侧 121ms / 客户端 7863ms,
+quickchat 桥侧 84ms / 客户端 8555ms。**下行节拍慢是通道固有,不是新缺陷。**
+
+**零分片复核**:本轮所有 `DONE` 只有三类 —— 单帧 echo(1 frame)、握手(11 frames/110B)、
+health 明细(5 frames/47B),外加 config(38 frames/375B)。
+**没有一条 `mode=delta` / `mode=full`** ⇒ 292 条名称保护 + 735 模板仍是烘焙兜底在扛
+(§8 第 4 条 delta 分片**尚未测**,用户还没改 `config/gamenames.json`)。
+
+**health 回声 8s 死线 vs STORM(老问题,本轮复现 1 次)**:
+09:07:41 RETRY crc consec=1 → 09:07:42 consec=2 进 STORM(`tClose=2500 rounds=4`,合计 10s)
+→ 09:07:46 consec=3 → 09:07:47 `REQ_TIMEOUT after 8000ms`。
+**8s < STORM 的 10s ⇒ 一旦进 STORM 这次回声必死**,这是 btipc04 时代的结构性冲突。
+但 09:07:54 下一发回声 `DONE 1831ms` → `onBridgeAlive` 清宽限,**没进 25s 判红窗口** ✓
+07:29 同型 2 次、本轮 1 次,约 1 次/几分钟;影响=日志噪声 + 宽限计时,**功能无损**。
+
+**翻译**:09:07:22 出站 `测试 → Testing`(bilingual,out=7ch)、
+09:07:24 入站 `Testing → 测试`(out=2ch),双向往返第三轮连续通。
+
+**§8 进度**:1 ✅ / 2 ✅ / 3 ⬜(需目视)/ 4 ⬜ / 5 ⬜ / 6 🟡(未误判红这一半 ✓,
+真关桥那一半未做)。

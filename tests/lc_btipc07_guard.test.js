@@ -128,6 +128,36 @@ for (const xml of ["chat.xml", "hudchat.xml"]) {
   const iMain = s.indexOf("scripts/lingua_chat.vjs_c");
   ok(iPairs > 0 && iMain > iPairs, xml + " 配对名单先于 lingua_chat 加载");
 }
+// 2026-10-03 游戏更新(buildid 25689475)后,聊天渲染路径会查
+// FindChildInLayoutFile("#TargetHeroImage");本 chat.xml 是 poker_chat 同源重建、
+// 没有这个面板 -> 查不到直接 FATAL "Unable to find child 'TargetHeroImage' in
+// layout file panorama\layout\chat.xml" -> tier0!Plat_FatalError ->
+// RaiseException(0x80000003) -> 游戏进程崩溃(2026-10-04 单日 9 个 dump)。
+// 必须放在 Ping snippet 内:MessageContents 是空容器、内容靠 snippet 注入,
+// 放静态子节点会被注入抹掉。
+{
+  const p = path.join(ROOT, "mod", "panorama", "layout", "chat.xml");
+  if (!fs.existsSync(p)) {
+    skip("chat.xml TargetHeroImage");
+  } else {
+    const s = fs.readFileSync(p, "utf8");
+    const a = s.indexOf('<snippet name="ChatMessageContents_Ping">');
+    const b = a >= 0 ? s.indexOf("</snippet>", a) : -1;
+    ok(a > 0 && b > a, "chat.xml 有 ChatMessageContents_Ping snippet");
+    ok(a > 0 && b > a && s.slice(a, b).includes('id="TargetHeroImage"'),
+      "chat.xml Ping snippet 声明 TargetHeroImage(缺则游戏 FATAL 崩溃)");
+    // 注释里可能含字面 <HTML>(本文件就有),先剔除注释再配平
+    const body = s.replace(/<!--[\s\S]*?-->/g, mm => "\n".repeat((mm.match(/\n/g) || []).length));
+    const stack = [];
+    let well = true;
+    for (const m of body.matchAll(/<(\/?)([A-Za-z_][\w:-]*)([^>]*?)(\/?)>/g)) {
+      if (m[4] === "/") continue;
+      if (m[1] === "/") { if (stack.pop() !== m[2]) { well = false; break; } }
+      else stack.push(m[2]);
+    }
+    ok(well && stack.length === 0, "chat.xml 标签配平");
+  }
+}
 if (fs.existsSync(PKG)) {
   const pkg = fs.readFileSync(PKG, "utf8");
   ok(/"sync_data\.js"/.test(pkg), "package_release 必需 core 清单含 sync_data.js");

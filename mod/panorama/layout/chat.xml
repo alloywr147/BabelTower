@@ -37,6 +37,18 @@
 		</snippet>
 		<snippet name="ChatMessageContents_Ping">
 			<Panel class="Ping">
+				<!-- 2026-10-03 游戏更新(buildid 25689475)补的面板,本重建(源自
+				     poker_chat 同源重建)没有 -> 任何 FindChildInLayoutFile("#TargetHeroImage")
+				     查不到就 FATAL "Unable to find child 'TargetHeroImage' in layout
+				     file panorama\layout\chat.xml" -> tier0!Plat_FatalError ->
+				     RaiseException(0x80000003) -> 游戏进程崩溃(今日 9 次 dump)。
+				     游戏 CSS 为证(chat.vcss_c):
+				     .ChatMessage .MessageBody #MessageContents.Ping #TargetHeroImage
+				       {width:20px;height:20px;margin-right:6px;visibility:collapse;}
+				     ... #TargetHeroImage.IsHeroPing {visibility:visible;}
+				     必须放 Ping snippet 内(注入进 MessageContents 的是这段内容,
+				     放静态子节点会被注入抹掉),且置于 Label 前,与 flow-right 排布一致。 -->
+				<Image id="TargetHeroImage" />
 				<Label id="PingLabel" text="{s:ping_text}" />
 			</Panel>
 		</snippet>

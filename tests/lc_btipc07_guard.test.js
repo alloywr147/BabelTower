@@ -146,6 +146,12 @@ for (const xml of ["chat.xml", "hudchat.xml"]) {
     ok(a > 0 && b > a, "chat.xml 有 ChatMessageContents_Ping snippet");
     ok(a > 0 && b > a && s.slice(a, b).includes('id="TargetHeroImage"'),
       "chat.xml Ping snippet 声明 TargetHeroImage(缺则游戏 FATAL 崩溃)");
+    // 2026-10-04 实车:聊天行原样显示 <span class="highlight">… 源码。PingLabel 是
+    // 富文本 Label,必须带 html="true" 才渲染标记;游戏当前编译产物实证有此属性,
+    // 我们的 poker_chat 同源重建漏了(普查 docs/panorama-api-census-6726.md 已记录:
+    // html="true" 仅 Ping 行 PingLabel 使用,消息正文是普通 Label)。
+    ok(a > 0 && b > a && /<Label id="PingLabel"[^>]*\bhtml="true"/.test(s.slice(a, b)),
+      'chat.xml PingLabel 带 html="true"(缺则 ping_text 富文本标记原样显示)');
     // 注释里可能含字面 <HTML>(本文件就有),先剔除注释再配平
     const body = s.replace(/<!--[\s\S]*?-->/g, mm => "\n".repeat((mm.match(/\n/g) || []).length));
     const stack = [];

@@ -171,5 +171,19 @@ ok(/quickchat sync: fingerprint match, no transfer/.test(lc), "quickchat 零传�
 ok(/gamenames sync applied: /.test(lc), "gamenames 有数据时有 applied 日志(delta/full)");
 ok(/quickchat templates /.test(lc), "quickchat 有数据时有 adopted 日志");
 
+// ---------- ⑨ 缺陷 A(2026-10-04 07:23 实车):死线必须 Date.now() 锚定 ----------
+// 实测 config 首读 msg=REQ_TIMEOUT 50000ms 却 dt=20278ms —— 单发 $.Schedule(50)
+// 在「加载进对局」的窗口里 21 秒就触发,把本该成功的读打死(白烧一次,配置就绪 48s)。
+console.log("--- 缺陷 A:BTIPC 死线不许再用单发 $.Schedule(大 N) ---");
+ok(/function afterRealMs\(/.test(lc), "存在 Date.now() 锚定的 afterRealMs");
+ok(/nowMs\(\) >= at/.test(lc), "到点判定用 nowMs(),不是调度时长");
+ok(/BTIPC_DEADLINE_POLL_SEC/.test(lc), "轮询步长常量存在");
+ok(!/\$\.Schedule\(timeoutMs \/ 1000,/.test(lc), "请求死线不再单发 $.Schedule(timeoutMs/1000)");
+ok(!/\$\.Schedule\(\(timeoutMs \+ 2000\) \/ 1000,/.test(lc), "deadman 不再单发(否则比死线长却更早触发,等于 A 换地方复发)");
+ok(/afterRealMs\(timeoutMs, function/.test(lc), "请求死线已接线到 afterRealMs");
+ok(/afterRealMs\(timeoutMs \+ 2000, function/.test(lc), "deadman 已接线到 afterRealMs");
+ok(/return State\.btipcActive === st/.test(lc), "死线 alive 守卫等价于旧的 btipcActive !== st");
+ok(/alive && !alive\(\)/.test(lc), "afterRealMs 支持 alive 提前停轮询");
+
 console.log("RESULT: PASS " + pass + " / FAIL " + fail + " / SKIP " + skipped);
 process.exit(fail > 0 ? 1 : 0);

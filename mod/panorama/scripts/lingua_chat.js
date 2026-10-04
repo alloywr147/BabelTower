@@ -2521,17 +2521,18 @@ function injectTranslation(row, sig, text, fragment) {
           settleOriginal("FAIL kind=" + kind + " msg=" + ((err && err.message) || "") +
               " dt=" + (nowMs() - t0) + "ms -> " + (isOp ? "respond error" : "send original"), kind);
         });
-      // 队列活性死线:BTIPC 自身 20s 死线 +2s 兜底。BTIPC 若因引擎异常永不确定,
+      // 队列活性死线:BTIPC 自身死线 +2s 兜底。BTIPC 若因引擎异常永不确定,
       // 这里强制结算(settled/_timedOut 置位后,迟到的 then/catch 直接忽略)。
+      // 同样走 afterRealMs:它比 BTIPC 死线更长,若沿用单发 $.Schedule 而长延时早触发,
+      // 就会抢在 BTIPC 死线之前把请求打死 —— 等于把缺陷 A 换个地方复发。
       try {
-        $.Schedule((timeoutMs + 2000) / 1000, function () {
-          if (settled || job._timedOut) return;
+        afterRealMs(timeoutMs + 2000, function () {
           settled = true;
           job._timedOut = true;
           log(tag + ": deadman fired (win=" + win + "), " + (isOp ? "respond timeout" : "send original"));
           doneFail("timeout");
           finishJob();
-        });
+        }, function () { return !(settled || job._timedOut); });
       } catch (e) {}
       return true;
     } catch (e) {
@@ -3828,6 +3829,28 @@ function injectTranslation(row, sig, text, fragment) {
   const BTIPC_CRC_DEAD = 8; // 同帧累计 fail 上限(§7)
   const BTIPC_REQ_MAX_PAYLOAD = 680; // §9:整行(引擎前缀+[LCT]+行头+b64 908)≤1000(J1);68 帧 ≤ seq7 上限
   const BTIPC_FIRST_SHOT_DELAY_MS = 1200; // 首拍延迟:桥 tail 轮询 1000ms,防首批全 404 误触风暴
+  // 死线轮询步长。死线改由 Date.now() 锚定(见 BTIPC.request 内 pollDeadline):
+  // $.Schedule(N) 的 N 秒在加载窗口内会早于 Date.now() 的 N 秒触发,拿它当死线不可信。
+  // 0.25s → 到点最多晚 0.25s 结算;单会话同时只有 1 个在途请求,4 次/秒空转可忽略。
+  const BTIPC_DEADLINE_POLL_SEC = 0.25;
+
+  // Date.now() 锚定的延迟结算 —— 所有「到点必须结算」的定时器走这里,不要直接
+  // $.Schedule(大 N)。实测(2026-10-04 07:23):config 首读 msg=REQ_TIMEOUT 50000ms
+  // 却 dt=20278ms,即 50s 的死线 21 秒就触发;窗口正好是加载进对局(Spawn Server /
+  // ss_loading -> ss_active、53.5% 帧 >17.5ms),加载结束后的第二次 25.6s 走满才成功
+  // —— 不是固定上限,是长延时的 $.Schedule 早于 Date.now()(同窗口 1.2s/2s/8s 的
+  // 短调度都准)。Date.now() 与 console 时间戳互相印证(21s ≈ 20.278s),错的是
+  // $.Schedule。早醒只重排、到点才调 fn;alive 返回假即停轮询(等价旧守卫,但不再
+  // 空转)。轮询用 0.25s:到点最多晚 0.25s,单会话同时只有 1 个在途请求,开销可忽略。
+  function afterRealMs(delayMs, fn, alive) {
+    const at = nowMs() + delayMs;
+    const tick = function () {
+      if (alive && !alive()) return;
+      if (nowMs() >= at) { fn(); return; }
+      $.Schedule(BTIPC_DEADLINE_POLL_SEC, tick);
+    };
+    $.Schedule(BTIPC_DEADLINE_POLL_SEC, tick);
+  }
 
   // ---- 内联 CRC-16/CCITT-FALSE(与 core/btipc/crc16.js 逐字节一致) ----
   function btipcCrc16(bytes) {
@@ -4152,11 +4175,13 @@ function injectTranslation(row, sig, text, fragment) {
               " len=" + bytes.length + " crc=" + crcHex + " b64=" + b64);
           btipcEnsureHandler();
           try {
-            $.Schedule(timeoutMs / 1000, function () {
-              if (State.btipcActive !== st) return;
+            // 缺陷 A 修:死线走 Date.now() 锚定的 afterRealMs。单发 $.Schedule(timeoutMs/1000)
+            // 在长延时上会早触发(实测 50s 死线 21s 就到),把本该成功的 config 读打死 ——
+            // 详见 afterRealMs 的注释。alive 覆盖旧的 State.btipcActive !== st 守卫。
+            afterRealMs(timeoutMs, function () {
               log("BTIPC: REQ_TIMEOUT win=" + st.win + " after " + timeoutMs + "ms");
               btipcFinish(st, false, { kind: "timeout", message: "REQ_TIMEOUT " + timeoutMs + "ms" });
-            });
+            }, function () { return State.btipcActive === st; });
             $.Schedule(BTIPC_FIRST_SHOT_DELAY_MS / 1000, function () {
               if (State.btipcActive !== st) return;
               btipcShot(st);

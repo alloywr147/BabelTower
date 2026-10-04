@@ -149,8 +149,11 @@ config fp=fnv1a-cde876fa -> match: true
 
 ## 8. 实车验收清单
 
-**首轮实车(2026-10-04 07:00,详见 checklist §17.8):第 1、3 条 PASS;第 2 条 PASS
-但当时无日志可见(已补,`btipc07b`);第 4、5、6 条未测。**
+**两轮实车(详见 checklist §17.8 / §17.9):1 ✅;2 ✅ —— 第二轮 07:24:07 与 07:24:16
+两条 `fingerprint match, no transfer` 已可见,握手各 `out=110B frames=11`,全程零分片;
+3 代码路径已跑到(无日志,**建议目视确认**);6 🟡 半测;4、5 ⬜ 未测。
+第二轮另挖出**缺陷 A**(单发 `$.Schedule(大 N)` 的死线早于 `Date.now()` 触发,
+把本该成功的 config 读打死),已在 `btipc07c` 修(见 §17.9)。**
 
 1. 控制台应出现 `game names: baked pairs loaded (292, fp=fnv1a-cde876fa)` —— ✅ 07:00:02;
 2. 首次 `bridge online` 后 ≤15 s 内出现零传输日志(常态 `total=0`,**不应**出现上百片)
@@ -162,7 +165,10 @@ config fp=fnv1a-cde876fa -> match: true
    `mode=delta`、3 片左右收齐、`gamenames applied … via delta`,期间发消息翻译不卡 —— ⬜ 未测
    (桥级 E2E 已覆盖同一条链路,29 PASS);
 5. 老包场景(删掉发布包里的 `mod\` 目录)→ 应退 `mode=full`,分片有进度、有预算护栏 —— ⬜ 未测;
-6. 来回切设置面板 / 关桥,状态栏应在宽限期后变红、恢复后自动清错 —— ⬜ 未测。
+6. 来回切设置面板 / 关桥,状态栏应在宽限期后变红、恢复后自动清错 —— 🟡 **半测**:
+   07:29 两次回声 8s 超时(STORM CRC 连败)→ `grace started`,15s 后再失败但**没撑到
+   25s 宽限**,07:29:49 回声 DONE → `onBridgeAlive` 清宽限,**全程没误判红**;
+   「真关桥 → 变红」那一半仍未做。
 
 ## 9. 已知取舍
 

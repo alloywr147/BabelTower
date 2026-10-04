@@ -736,3 +736,63 @@ quickchat 全量 13 536B → 全量 107~151 片 ≈ **18~25 分钟**。所以:
 
 **装车**:`bak-pre-btipc07b-20261004-071235`(450084B)→ 槽位 451733B,
 SHA256 `0BF7B6CC1289DE0F` == dist 源;备份链 btipc07b ← btipc07 ← navdeadfix 三级可回滚。
+
+### 17.9 第二轮实车(2026-10-04 07:22,btipc07b)+ 缺陷 A(`btipc07c`)
+
+**§17.8 两处修补实车生效**
+
+| 证据 | 判定 |
+|---|---|
+| `07:24:07 gamenames sync: fingerprint match, no transfer (292 entries)` | 修复②的日志出现了 |
+| `07:24:16 quickchat sync: fingerprint match, no transfer (735 templates)` | 同上 |
+| 两次握手各 `out=110B frames=11`,6 分钟内**全程零分片** | `same=true, total=0` 常态成立 |
+| config 本轮只拉 **2 次**(07:22:57 超时 / 07:23:20 成功),`boot: config synced` 仅一条 | 修复①防重入生效(上轮 3 次) |
+| 出站 `你好 → hello` 双语 1797ms;入站 `hello → 你好` 2498ms;no-op `help → help` 按原文发 | 翻译链路首次真测,三条全通 |
+
+**缺陷 A(本轮发现)—— `$.Schedule(大 N)` 的死线早于 `Date.now()` 触发**
+
+```
+07:23:18  config btipc: FAIL kind=timeout msg=REQ_TIMEOUT 50000ms dt=20278ms
+```
+
+请求 `w=13ef57` 发于 07:22:57 → **50s 的死线 21 秒就到了**。证据链:
+
+- 窗口 07:22:57→07:23:18 正是**加载进对局**(`Spawn Server`、`ss_loading -> ss_active`、
+  `Frame Time >17.5ms 53.5%`);
+- **对照组**:加载结束后的第二次(07:23:20 起)`$.Schedule(50)` 走满 **25.6s** 才成功
+  → 不是固定上限,是窗口性早触发;同窗口 1.2s / 2s / 8s 的短调度都准;
+- `Date.now()` 的 20.278s 与 console 时间戳 21s 互相印证 → **错的是 `$.Schedule`**。
+
+代价:白烧一次 50s 死线的读 → 配置就绪 **48s(应 23s)**,gamenames/quickchat 就绪
+**79s(应 ~54s)**;功能损失 **0**(烘焙 fallback 内容逐字相同,兜得住),纯时序浪费。
+
+**修法**:新增 `afterRealMs(delayMs, fn, alive)` —— `Date.now()` 锚定 + `BTIPC_DEADLINE_POLL_SEC=0.25`
+轮询,早醒只重排、到点才结算、`alive` 为假即停轮询。两处接线:
+
+1. **BTIPC 请求死线**(原 `$.Schedule(timeoutMs / 1000)`);
+2. **队列活性 deadman**(原 `$.Schedule((timeoutMs + 2000) / 1000)`)—— **必须一起换**:
+   它比死线更长,若沿用单发 `$.Schedule` 而长延时早触发,就会抢在死线之前把请求打死,
+   等于缺陷 A 换个地方复发。
+
+**明确不动的**:旧通道里 `dispatchJob` 的 `$.Schedule(20)`(`viaBtipc` 先返回,走不到)、
+`checkBridgeMissing` 的 `$.Schedule(12)`(见下)。
+
+**假红复核(仍记账不修)**:07:22:58 `bridge offline: 请先启动 core/bridge_server.js`
+在 boot 内就打出。`warnBridgeOffline` 只有两个调用点(`pollTitle` / `checkBridgeMissing`),
+而 boot 时 `State.pending` 只可能来自旧通道 `setPending`(deadline ≥15s)—— 时间对不上,
+最可能是 `checkBridgeMissing`。**但根因是 panel nav 在 6726 全灭 + boot 时
+`State.bridgeUp` 尚未被 BTIPC 证明;把 12s 调度改准也只是把这条从 +1s 挪到 +12s,
+`panelWarned` 一锁就不再复原。** 31s 后被 `markBridgeUp` 修好。⇒ **时间不改变结论,不动。**
+
+**验收 §8 进度**:1 ✅ / 2 ✅ / 3 代码路径已跑到(`onBridgeAlive` 写
+`桥已连接 · bing`、health detail 带 provider;这行无日志,**建议目视确认**)/ 4 ⬜ / 5 ⬜ /
+6 🟡 半测 —— 07:29 两次回声 8s 超时(STORM CRC 连败),`grace started` 后 15s 又失败但
+**没撑到 25s 宽限**,07:29:49 回声 DONE → `onBridgeAlive` 清宽限,**全程没误判红**;
+真关桥那一半未做。
+
+**测试**:`lc_btipc07_guard` 62 → **71 PASS**(新增缺陷 A 九条:死线/deadman 都必须接
+`afterRealMs`、单发 `$.Schedule(timeoutMs/1000)` 必须绝迹);全量 19/19;
+桥级 E2E **29/29**(delta 3 片、指纹对齐、config 字节级还原)。
+
+**装车**:`bak-pre-btipc07c-20261004-084505`(451733B)→ 槽位 453743B,
+SHA256 `2647B7D0B5674A49` == dist;备份链 **c ← b ← a ← navdeadfix** 四级可回滚。

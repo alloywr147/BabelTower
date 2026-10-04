@@ -38,6 +38,16 @@ function getDistZip() {
   return zips[0] || null;
 }
 
+// 口径(docs/ipc-checklist-6726.md §16.7):VERSION 文件 / git tag / zip 包名 = 发布号;
+// 代码内 const VERSION = 打进 pak 的自报串,允许带 `-<构建标>` 后缀(如 1.0.8-6726-btipc07d),
+// 后缀只出现在游戏日志 `loaded vX.Y.Z-…` 里,用于追溯具体构建。
+// 2026-10-04 修正:本脚本写于 1.0.0-beta.2 时代,`vf !== cv` 与该口径冲突,
+// 自 v1.0.1 起每次发版都误报红。真正要抓的是"主版本对不上"(如代码 1.0.7 而包 1.0.8)。
+function sameRelease(codeVer, releaseVer) {
+  if (!codeVer || !releaseVer) return false;
+  return codeVer === releaseVer || codeVer.startsWith(releaseVer + "-");
+}
+
 const vf = readVersionFile();
 const cv = readCodeVersion();
 const tag = getLastTag();
@@ -51,7 +61,7 @@ console.log("dist 最新 zip  :", zip ?? "(无)");
 
 if (!vf) problems.push("VERSION 文件缺失");
 if (!cv) problems.push("lingua_chat.js 内 VERSION 常量未找到");
-if (vf && cv && vf !== cv) problems.push(`VERSION 文件(${vf}) ≠ 代码常量(${cv})`);
+if (vf && cv && !sameRelease(cv, vf)) problems.push(`VERSION 文件(${vf}) ≠ 代码常量主版本(${cv})`);
 if (vf && tag && !tag.includes(vf) && !/beta/i.test(tag)) {
   // 正式 tag 必须匹配 VERSION；beta tag 允许 v<next>-beta.N（代码比 VERSION 文件新一个 beta 阶段）
   problems.push(`最近 tag(${tag}) 与 VERSION 文件(${vf}) 不匹配`);
@@ -64,8 +74,8 @@ if (zip && cv) {
   const m = zip.match(/BabelTower-(\d+\.\d+\.\d+(?:-beta\.\d+)?)-win64\.zip/);
   if (m) {
     const zipVer = m[1];
-    if (zipVer !== cv) {
-      problems.push(`最新包 ${zip} 的版本(${zipVer}) ≠ 代码内 VERSION(${cv}) —— 装包后游戏内会显示 v${cv}, 版本自述与包名不符`);
+    if (!sameRelease(cv, zipVer)) {
+      problems.push(`最新包 ${zip} 的版本(${zipVer}) ≠ 代码内 VERSION 主版本(${cv}) —— 装包后游戏内会显示 v${cv}, 版本自述与包名不符`);
     }
   }
 }

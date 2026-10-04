@@ -44,6 +44,12 @@ check("development 冒烟清单含 console.log 校验", /condebug/.test(read("do
   /console\.log found/.test(read("docs/development.md")));
 check("architecture 记录 ① 上行硬依赖 -condebug",
   /上行硬依赖 `-condebug`/.test(read("docs/architecture.md")));
+// 包内《安装使用说明.txt》是玩家唯一必读文档 —— 2026-10-04 按用户要求补上:
+// 10-03 玩家反馈就是从 Steam 直接启动游戏、教程里没提这个参数才踩的坑。
+const tut = read("安装使用说明.txt");
+check("安装教程含 -condebug 必做步骤", /-condebug/.test(tut) && /启动选项/.test(tut));
+check("安装教程说明为什么必做(不设会静默失效)", /console\.log/.test(tut) && /静默失效/.test(tut));
+check("安装教程给出判据 console.log found", /console\.log found/.test(tut));
 
 console.log("\nRESULT: PASS " + pass + " / FAIL " + fail);
 process.exit(fail ? 1 : 0);

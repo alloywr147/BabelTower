@@ -25,7 +25,22 @@ Babel Tower - Deadlock 聊天翻译 Mod 安装使用说明
      卸载自启:双击 remove-autostart.bat
    方法 B(临时):双击 StartDeadlock.bat(每次玩之前都要双击一次)
 
-4. 启动游戏,进任意一局(训练场也行):
+4. 给 Deadlock 加 -condebug 启动参数(必做,只需设置一次):
+   Steam 库 → Deadlock 右键 → 属性 → 常规 → 启动选项 → 填 -condebug
+
+   为什么必做:
+     游戏只有带这个参数启动,才会生成 console.log 文件;而本地桥唯一能收到
+     游戏消息的途径就是读这个文件。不设它,翻译链路完全不工作 —— 而且是
+     静默失效:游戏里 /tr 能开、设置能存、看起来一切正常,但你的消息根本
+     没送到桥,logs\bridge.log 里一条消息流量都没有。
+
+   - 用第 3 步方法 B(StartDeadlock.bat)启动游戏的,已自动带上该参数,可跳过本步;
+   - 用方法 A(开机自启)+ 自己从 Steam 正常启动游戏的,必须手动设一次;
+   - 怎么确认生效:游戏跑起来后看 logs\bridge.log,应有一行
+     `game console.log found: ...`;若出现 `[warn] 缺少 -condebug`,
+     按上面的路径补设一次即可(设一次永久生效)。
+
+5. 启动游戏,进任意一局(训练场也行):
    - 按 Enter 打开聊天,输入 /tr 回车,打开设置面板
    - 点"测试"按钮,应显示"测试成功: 你好"
    - 点"保存",ESC 关闭面板
@@ -81,6 +96,14 @@ A: 启动器做了入口自检:缺哪个文件就直接点名,不再抛 PowerShe
 
 Q: 游戏里没反应?
 A: 确认 VPK 装到了 addons 目录且游戏完全重启过;确认 /tr 能打开设置面板。
+
+Q: /tr 能开、设置能存,但队友的外语消息不翻译;logs\bridge.log 里也看不到自己发的消息?
+A: 基本可以断定是游戏没带 -condebug 启动参数(见安装第 4 步)。游戏不带它就不生成
+   console.log,桥收不到游戏的任何消息,翻译链路静默失效。
+   修复:Steam 库 → Deadlock 右键 → 属性 → 常规 → 启动选项 填 -condebug(设一次即可),
+   然后完全重启游戏。或改用 StartDeadlock.bat 启动(已自动带该参数)。
+   判据:logs\bridge.log 里出现 `game console.log found: ...` 即正常;
+   若看到 `[warn] 缺少 -condebug`,说明参数没生效,或设完后游戏没完全重启。
 
 Q: 想卸载?
 A: 游戏部分:Mod Manager 里禁用/删除,或删掉 addons 里对应的 vpk。

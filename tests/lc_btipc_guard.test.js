@@ -77,7 +77,12 @@ const ver = (src.match(/const VERSION = "([^"]+)"/) || [])[1] || "";
 // 版本号 = 当前开发版(与 lingua_chat.js 的 const VERSION 必须同步,升版时两处一起改);
 // 发布时若需与 Release 标签对齐,改完发包后要把这里和 VERSION 一并推到下一开发版,
 // 玩家日志 `loaded vX.Y.Z-…` 才始终能和 Release/GB 页面对上号。
-check("VERSION 已升版(含 btipc 标)", /1\.0\.7-6726-btipc\d/.test(ver), "got=" + ver);
+// 从 VERSION 文件取发布号做比对 —— 正则写死具体版本号会每次升版腐烂一次,
+// 而这条检查的本意(见上方注释)是"两者必须一起改",所以比主版本而不是写死。
+const relVer = fs.readFileSync(path.join(__dirname, "..", "VERSION"), "utf8").trim();
+check("VERSION 已升版(带 -6726-btipc 构建标)", /^\d+\.\d+\.\d+-6726-btipc\d/.test(ver), "got=" + ver);
+check("包内自报串主版本 == VERSION 文件(升版两处必须一起改)",
+  ver.split("-")[0] === relVer, "ver=" + ver + " VERSION=" + relVer);
 check("BTIPC 面板前缀 BTIPCD(6 字符,与探针隔离)",
   /BTIPC_PANEL_PREFIX = "BTIPCD"/.test(src));
 

@@ -1,5 +1,6 @@
-// gb_add_update2.js — 发布 1.0.7 更新日志: UMM 设置联动 + 指纹丢失根治
-// 2026-10-03: 1.0.6 这个号 9/25 已被 GameBanana 用掉(README L12 即证据),本脚本随之改为 1.0.7。
+// gb_add_update2.js — 发布 1.0.8 更新日志: 修消息不进本地桥 + 聊天行露 HTML + 崩溃 + 安装教程补 -condebug
+// 2026-10-04: 发 1.0.8。1.0.7 已于 10-03 发出(条目 460737),本脚本原样新增一条,不动旧条目。
+// 发版前查重: gh release list 最新 v1.0.7、gb_updates_probe 1.0.8 含[1.0.8]=false -> 1.0.8 未消耗。
 // 用法: node gb_add_update2.js
 const puppeteer = require("puppeteer-core");
 const fs = require("fs");
@@ -11,17 +12,18 @@ const UPDATES_URL = "https://gamebanana.com/mods/updates/700107";
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-const TITLE = "1.0.7 本地桥与通信层更新：新增 BTIPC 模块，请整包升级（含 HUD 气泡修复）";
-const VERSION = "1.0.7";
+const TITLE = "1.0.8 修复消息不进本地桥(翻译静默失效)+ 聊天行原样显示 HTML,请整包升级";
+const VERSION = "1.0.8";
 
 const CHANGELOG = [
-  ["Feature", "本地桥与通信层(本版主要改动):新增 core/btipc/ 四个模块,bridge_server.js 由 37,809B 增至 57,524B;出站翻译、入站聊天翻译、配置读写全部改走 BTIPC 信道,替代 6726 版本后失效的 SetURL 导航。规格 docs/btipc-v1.md 已冻结。"],
-  ["Bugfix", "必须整包解压覆盖,勿只导入 pak:游戏侧三类任务优先走 BTIPC,旧桥没有 /btipc/dl 端点会让它们超时后按原文发送,配置操作返回 ok:false。"],
-  ["Bugfix", "次要修复——HUD 顶栏气泡不挂译文:顶栏是统一模板,PingStyleIcon 等常驻槽位被递归匹配误判成快捷语音,导致译文永远挂不上;现要求 quick 有文本侧佐证才跳过,聊天/大厅行行为一字不变。"],
-  ["Feature", "沿用 1.0.6:游戏内 UMM 设置窗口出现「巴别塔」标签页,10 项常用设置直接改,即时生效并双向持久化;不装 UMM 完全不影响本 mod。"],
+  ["Bugfix", "本版主要修复——消息不再进本地桥(翻译静默失效):出站队列是单槽设计,某次同步任务抛异常时槽位没有归还,队列从此不再派发任何任务。表现为游戏里 /tr 能开、设置能存、看起来一切正常,但消息根本没送到翻译桥,logs\\bridge.log 里一条消息流量都没有。现已给派发加异常兜底:槽位必还、真实错误落日志、超限后按原文发送,不吞用户消息。"],
+  ["Bugfix", "聊天行原样显示 HTML 源码:游戏 10-03 更新后,快捷语音消息(如「Abrams的大招好了」)会把 <span class=\"highlight\"> 标记当纯文本露出来。原因是游戏给 PingLabel 加了富文本开关 html=\"true\",本 mod 的布局没跟上,现已补齐。"],
+  ["Bugfix", "游戏崩溃(聊天渲染查不到面板):补上 TargetHeroImage 面板,消除 10-03 更新后的 Unable to find child 'TargetHeroImage' 致命错误。"],
+  ["Feature", "健康 / 快捷语音 / 英雄物品名改走 BTIPC 信道;292 条名称保护名单改为随游戏更新自动增量同步,游戏更新名字后不再需要整包升级。"],
+  ["Bugfix", "《安装使用说明.txt》新增 -condebug 启动参数步骤(必做):游戏不带该参数就不生成 console.log,而本地桥只能靠它收游戏消息——不设就是静默失效。设置路径:Steam 库 → Deadlock 右键 → 属性 → 常规 → 启动选项 填 -condebug(设一次永久生效);用 StartDeadlock.bat 启动的已自动带上,可跳过。"],
 ];
 
-const BLURB = "本版的主要改动在**本地桥与通信层**:新增 core/btipc/ 四个模块(BTIPC v1),出站翻译、入站聊天翻译、配置读写全部改走这条新信道,替代 6726 版本后失效的 SetURL 导航。因此必须整包解压覆盖、勿只导入 pak —— 只导 pak 会让翻译链路超时后按原文发送。次要修复:HUD 顶栏气泡此前因快捷语音误判而不挂译文,现已修复。安装(3 步):解压 zip → Mod Manager 导入 pak01_dir.vpk → powershell -ExecutionPolicy Bypass -File scripts\\autostart.ps1 -Action Install,然后游戏内 /tr → 测试 → 保存。详细说明见包内《安装使用说明.txt》。";
+const BLURB = "本版以修复为主:**消息不进本地桥导致翻译静默失效**已修(出站队列单槽泄漏,某次任务抛异常后队列永久停摆,游戏里看着正常但消息根本没送到桥)。同时修了聊天行原样显示 HTML 源码、以及 10-03 游戏更新带来的崩溃(TargetHeroImage 面板缺失)。安装教程已补上 **-condebug 启动参数**这一步——它不设翻译链路就是静默失效,Steam 库 → Deadlock 右键 → 属性 → 常规 → 启动选项 填 -condebug(设一次即可)。安装(3 步):解压 zip → Mod Manager 导入 pak01_dir.vpk → powershell -ExecutionPolicy Bypass -File scripts\\autostart.ps1 -Action Install,然后游戏内 /tr → 测试 → 保存。沿用 1.0.6:游戏内 UMM 设置窗口有「巴别塔」标签页,不装 UMM 完全不影响本 mod。详细说明见包内《安装使用说明.txt》。";
 
 async function loadCookies(page) {
   if (!fs.existsSync(COOKIES_FILE)) return;
@@ -136,15 +138,15 @@ async function setInput(page, selector, value) {
     console.log("  BLURB LEN:", blurbLen, "/", BLURB.length);
   }
 
-  // 勾选要发布的文件:严格优先 107(本版),106/105 只作兜底。
+  // 勾选要发布的文件:严格优先 108(本版),107/106/105 只作兜底。
   // 原实现 .find() 返回 DOM 中先出现者,而 babeltower-105-win64.zip 仍在列表里
   // 且常排在本版之前 → 会误勾 1.0.5 的包(9/25 那条 1.0.6 就是这么绑错的);
   // 另有已勾选状态未检查、再点会反勾的风险。
   const fileChecked = await page.evaluate(() => {
     const boxes = [...document.querySelectorAll("input[type=checkbox]")];
     const labelOf = (b) => ((b.closest(".RadioCheckWrapper") || {}).innerText || "");
-    const cands = boxes.filter((b) => /babeltower-10[567]-win64/i.test(labelOf(b)));
-    const target = cands.find((b) => /babeltower-107-win64/i.test(labelOf(b))) || cands[0];
+    const cands = boxes.filter((b) => /babeltower-10[5678]-win64/i.test(labelOf(b)));
+    const target = cands.find((b) => /babeltower-108-win64/i.test(labelOf(b))) || cands[0];
     if (!target) return { ok: false, total: boxes.length, cands: cands.length };
     const label = labelOf(target).replace(/\s+/g, " ").trim().slice(0, 60);
     if (!target.checked) target.click();
